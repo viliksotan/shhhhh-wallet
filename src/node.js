@@ -1,5 +1,5 @@
-// Client for the shhhhh node bridge (node.shhhhh.site): finds the wallet's coins with Frigate, then checks every
-// result locally with the wallet's own keys (the server is never trusted to say what is ours), then asks which
+// Client for the shhhhh node bridge (node.shhhhh.site): sends the scan private key and spend public key to
+// Frigate, then checks every result locally (the server is never trusted to say what is ours), then asks which
 // coins are unspent, what inscriptions they carry, and the BRC-20 balances of our addresses.
 import { Transaction } from '@scure/btc-signer';
 import { Point, labelTable, bytesToHex, hexToBytes } from './sp.js';

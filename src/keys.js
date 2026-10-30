@@ -5,6 +5,7 @@ import { HDKey } from '@scure/bip32';
 import { bytesToNumberBE } from '@noble/curves/abstract/utils';
 import { keysToAddress, Point, N, tagged, bytesToHex } from './sp.js';
 import { bech32m } from '@scure/base';
+import { STAKE_PATH, stakeKey } from './stake.js';
 
 // BIP352 derivation: scan m/352'/0'/0'/1'/0, spend m/352'/0'/0'/0'/0 (coin type 0 = mainnet)
 export const SCAN_PATH = "m/352'/0'/0'/1'/0", SPEND_PATH = "m/352'/0'/0'/0'/0";
@@ -23,7 +24,11 @@ export function walletFromSeed(seed) {
   const root = HDKey.fromMasterSeed(seed);
   const bScan = bytesToNumberBE(root.derive(SCAN_PATH).privateKey);
   const bSpend = bytesToNumberBE(root.derive(SPEND_PATH).privateKey);
-  return { ...walletFromKeys(bScan, bSpend), deposit: bip86(bytesToNumberBE(root.derive(DEPOSIT_PATH).privateKey)) };
+  return {
+    ...walletFromKeys(bScan, bSpend),
+    deposit: bip86(bytesToNumberBE(root.derive(DEPOSIT_PATH).privateKey)),
+    stake: stakeKey(bytesToNumberBE(root.derive(STAKE_PATH).privateKey)),
+  };
 }
 
 // Deposit address: a normal BIP86 taproot address from the same phrase (the first address UniSat / Xverse show),

@@ -1,6 +1,7 @@
-// Local preview: http://127.0.0.1:8362 serves ./dist and proxies /api/sp-index to shhhhh.site. This Mac only.
+// Local preview: http://127.0.0.1:8362 serves ./dist and proxies /api/sp-index to shhhhh.site.
 import http from 'node:http'; import fs from 'node:fs'; import path from 'node:path';
-const PORT = 8362, DIST = new URL('../dist/', import.meta.url).pathname;
+import { fileURLToPath } from 'node:url';
+const PORT = 8362, DIST = fileURLToPath(new URL('../dist/', import.meta.url));
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.png': 'image/png', '.json': 'application/json' };
 http.createServer(async (req, res) => {
   if (!['127.0.0.1:' + PORT, 'localhost:' + PORT].includes(req.headers.host)) { res.writeHead(403); return res.end(); }

@@ -2,9 +2,17 @@
 //   node tools/e2e.mjs [outDir]   (dev server must be running on 127.0.0.1:8362)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 const OUT = process.argv[2] || '.';
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const profile = fs.mkdtempSync(OUT + '/chrome-');
+fs.mkdirSync(OUT, { recursive: true });
+const candidates = process.platform === 'win32'
+  ? ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe']
+  : process.platform === 'darwin'
+    ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+    : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+const CHROME = process.env.CHROME || candidates.find((candidate) => fs.existsSync(candidate));
+if (!CHROME) throw new Error('Chrome/Edge not found. Set CHROME to a Chromium executable.');
+const profile = fs.mkdtempSync(path.join(path.resolve(OUT), 'chrome-'));
 const chrome = spawn(CHROME, ['--headless=new', '--remote-debugging-port=9333', '--user-data-dir=' + profile, '--window-size=430,900', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let ws, id = 0; const pending = new Map(); const errors = [];
@@ -17,7 +25,7 @@ async function connect() {
 }
 const send = (method, params = {}) => new Promise((res, rej) => { const i = ++id; pending.set(i, { res, rej }); ws.send(JSON.stringify({ id: i, method, params })); });
 const js = async (expr) => { const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || JSON.stringify(r.exceptionDetails).slice(0, 300)); return r.result.value; };
-const shot = async (name) => { const r = await send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(`${OUT}/${name}.png`, Buffer.from(r.data, 'base64')); };
+const shot = async (name) => { const r = await send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(OUT, name + '.png'), Buffer.from(r.data, 'base64')); };
 const waitFor = async (expr, ms = 60000) => { const t = Date.now(); while (Date.now() - t < ms) { if (await js(expr)) return true; await sleep(250); } throw new Error('timeout waiting for ' + expr); };
 const click = (text) => js(`[...document.querySelectorAll('button')].find(b => b.textContent.trim() === ${JSON.stringify(text)}).click()`);
 const tap = (text) => js(`[...document.querySelectorAll('button')].find(b => b.textContent.includes(${JSON.stringify(text)})).click()`);
@@ -76,6 +84,7 @@ try {
   const sendErr = await js(`document.querySelector('.sheet .err').textContent`);
   ok(/no BTC|not enough/i.test(sendErr), 'Send > Review shows an in-sheet message: ' + sendErr);
   // custom fee: empty -> clear message; 2.5 sat/vB -> accepted (the empty wallet then says no BTC)
+  await waitFor(`[...document.querySelectorAll('.sheet .seg3 button')].some(b => b.textContent.includes('Custom'))`);
   await js(`[...document.querySelectorAll('.sheet .seg3 button')].find(b => b.textContent.includes('Custom')).click()`); await sleep(200);
   ok(await js(`!document.querySelector('.sheet .custom-fee').hidden`), 'fee picker: Custom shows a rate box');
   await js(`[...document.querySelectorAll('.sheet button')].find(b => b.textContent.trim() === 'Review').click()`); await sleep(300);

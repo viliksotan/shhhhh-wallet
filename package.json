@@ -1,15 +1,18 @@
 {
   "name": "shhhhh-wallet",
   "version": "1.0.0",
-  "description": "",
+  "description": "A private Bitcoin wallet for Chrome built on BIP352 silent payments.",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/sp.test.js && node test/scan.test.js && node test/keys.test.js && node test/features.test.js",
+    "build": "node tools/build.mjs",
+    "build:extension": "node tools/build-extension.mjs",
+    "dev": "node tools/dev-server.mjs"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@noble/curves": "^1.9.7",
     "@noble/hashes": "^1.8.0",

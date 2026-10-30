@@ -1,16 +1,18 @@
-// shhhhh silent wallet: UI. Keys never leave the browser; storage is encrypted with the password.
+// shhhhh silent wallet: UI. Spending keys stay in the browser; storage is encrypted with the password.
 import qrcode from 'qrcode-generator';
 import * as K from './keys.js';
-import { bytesToHex, outputPrivKey, decodeAddress } from './sp.js';
-import { NODE, TAPROOT_START, MIN_START, getTip, getFees, syncWallet, spendable, broadcast, contentUrl, liveWatch, getDeposit , getTxStatus } from './node.js';
+import { bytesToHex, hexToBytes, outputPrivKey, decodeAddress, tagged, signMsg } from './sp.js';
+import { NODE, TAPROOT_START, MIN_START, getTip, getFees, syncWallet, spendable, broadcast, contentUrl, liveWatch, getDeposit, getTxStatus, getTxHex, getOutspends, getOutputInscriptions } from './node.js';
 
 // shhhhh wallet launched after this block: wallets made here cannot have older payments, so restores start here by default
 const SHHHHH_START = MIN_START;
 import { buildSend, buildSendInscription, vsizeOf, DUST } from './send.js';
-import { buildInscribeTransfer } from './inscribe.js';
+import { buildInscribeTransfer, buildInscribe, MAX_INSCRIPTION_BYTES } from './inscribe.js';
+import { stakeTarget, buildUnstake, MIN_STAKE, BLOCKS_PER_DAY } from './stake.js';
+import { createOffer, verifyOffer, cancelOffer, buildPurchase, MIN_PRICE, MAX_PRICE, ROYALTY_BPS, PREPARE_COIN_VALUE } from './market.js';
 import { kv } from './db.js';
 import { taprootAddress } from './scan.js';
-import { Address, NETWORK } from '@scure/btc-signer';
+import { Address, NETWORK, Transaction } from '@scure/btc-signer';
 const LS_NAME = 'shhhhh.name';                                   // wallet name shown in the header (this browser only)
 const walletName = () => (store.get(LS_NAME) || '').trim() || 'Silent wallet';
 const LS_VAULT = 'shhhhh.vault', LS_STATE = 'shhhhh.state', LS_PARTIAL = 'shhhhh.scan';  // scan progress of an unfinished first sync
@@ -236,7 +238,18 @@ async function dappScreen() {
         h('div', { class: 'mono' }, S.wallet.address)],
       [h('button', { class: 'main pill-btn', onclick: async () => {
           const list = await connectedSites(); if (!list.includes(dappReq.origin)) await chrome.storage.local.set({ shhhhhSites: [...list, dappReq.origin] });
-          done({ result: { address: S.wallet.address } }, 'Connected ✓');
+          if (dappReq.origin === DAPP_STAKE_ORIGIN) await Promise.race([refreshDeposit().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 6000))]);
+          const anchorage = dappReq.origin === DAPP_STAKE_ORIGIN && S.wallet.stake ? {
+            stakeKey: S.wallet.stake.xonly,
+            deposit: S.wallet.deposit.address,
+            height: (S.state && S.state.height) || 0,
+            tokens: ((S.state && S.state.brc20) || []).map((token) => ({
+              tick: token.tick,
+              available: holders(token.tick).reduce((sum, item) => sum + item.available, 0),
+              most: (holders(token.tick)[0] || {}).available || 0,
+            })),
+          } : {};
+          done({ result: { address: S.wallet.address, ...anchorage } }, 'Connected ✓');
         } }, 'Connect'), cancel]);
   }
   if (dappReq.method === 'sendBitcoin') {
@@ -246,7 +259,8 @@ async function dappScreen() {
     let to; try { to = validDest(String(address || '')); } catch (x) { return fail('The site sent a bad address.'); }
     if (!Number.isInteger(sats) || sats < DUST || sats > 1e8) return fail('The site asked for an invalid amount.');
     if (!S.state || !Array.isArray(S.state.coins)) return fail('Your wallet has not finished syncing yet. Open the shhhhh wallet, wait until it says Synced, then try again.');
-    await refreshDeposit().catch(() => {});
+    dappPreparing();
+    await Promise.race([refreshDeposit().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 6000))]);
     let rate = 2; try { rate = (await getFees()).normal; } catch {}
     const siteRate = typeof feeRate === 'number' && feeRate >= 0.1 && feeRate <= 500 ? feeRate : null;   // a site may ask for a fee rate (shown below)
     if (siteRate) rate = siteRate;
@@ -262,7 +276,301 @@ async function dappScreen() {
     box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' });
     return;
   }
+  if (dappReq.method === 'inscribe') return dappInscribe(done, site);
+  if (dappReq.method === 'stake' || dappReq.method === 'unstake') return dappStake(done, site);
+  if (dappReq.method === 'proveHolding') return dappProof(done, site, cancel);
+  if (['listForSale', 'cancelListing', 'buyListing', 'myItems'].includes(dappReq.method)) return dappMarket(done, site);
   done({ error: 'Unknown request' });
+}
+
+const DAPP_STAKE_ORIGIN = 'http://127.0.0.1:8372';
+const dappFail = (done, title, message) => gate(
+  [h('h2', {}, title), h('p', { class: 'warn' }, message)],
+  [h('button', { class: 'main pill-btn', onclick: () => done({ error: message }) }, 'Close')],
+);
+const dappPreparing = () => gate(
+  [h('h2', {}, 'Preparing…'), h('div', { class: 'sync-what' }, h('span', { class: 'spin' }), 'Checking your coins')],
+  [],
+);
+
+async function prepareDapp(done, title) {
+  if (!(await connectedSites()).includes(dappReq.origin)) { dappFail(done, title, 'Connect this site first.'); return false; }
+  if (!S.state || !Array.isArray(S.state.coins)) {
+    dappFail(done, title, 'Your wallet has not finished syncing yet. Open the shhhhh wallet, wait until it says Synced, then try again.');
+    return false;
+  }
+  dappPreparing();
+  await Promise.race([refreshDeposit().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 6000))]);
+  return true;
+}
+
+async function dappInscribe(done, site) {
+  const title = 'Inscribe request';
+  if (!(await connectedSites()).includes(dappReq.origin)) return dappFail(done, title, 'Connect this site first.');
+  if (!S.state || !Array.isArray(S.state.coins)) return dappFail(done, title, 'Your wallet has not finished syncing yet. Open the shhhhh wallet, wait until it says Synced, then try again.');
+  const { items, feeRate } = dappReq.params || {};
+  const allowed = /^(text\/plain|application\/json|image\/(png|jpeg|gif|webp|avif|svg\+xml))(;charset=utf-8)?$/i;
+  let decoded;
+  try {
+    if (!Array.isArray(items) || !items.length || items.length > 25) throw new Error('between 1 and 25 inscriptions at a time');
+    decoded = items.map((item) => {
+      if (!item || !allowed.test(String(item.contentType || ''))) throw new Error('unsupported content type');
+      const body = Uint8Array.from(atob(String(item.data || '')), (c) => c.charCodeAt(0));
+      if (!body.length || body.length > MAX_INSCRIPTION_BYTES) throw new Error(`each inscription must be 1 to ${MAX_INSCRIPTION_BYTES} bytes`);
+      return { contentType: String(item.contentType), body };
+    });
+  } catch (e) { return dappFail(done, title, 'The site sent an invalid inscription: ' + e.message); }
+  if (!(typeof feeRate === 'number' && feeRate >= 0.1 && feeRate <= 500)) return dappFail(done, title, 'The site asked for an invalid fee rate.');
+  if (!(await prepareDapp(done, title))) return;
+
+  const nonce = Date.now();
+  const build = () => buildInscribe({ wallet: S.wallet, utxos: walletCoins(), items: decoded, feeRate, changeAddress: S.wallet.changeAddress, to: S.wallet.address, nonce });
+  let preview;
+  try { preview = build(); } catch (e) { return dappFail(done, title, friendly(e.message)); }
+  const bytes = decoded.reduce((sum, item) => sum + item.body.length, 0);
+  const first = decoded[0];
+  const sample = /^text|json/i.test(first.contentType) ? new TextDecoder().decode(first.body.slice(0, 120)) : first.contentType.split(';')[0];
+  const box = h('div', { class: 'sheet dapp' }); screen(box);
+  reviewIn(box, {
+    title: 'Inscribe for ' + site,
+    cta: 'Confirm & inscribe',
+    hero: { big: decoded.length === 1 ? '1 inscription' : `${decoded.length} inscriptions`, sub: `${fmt(bytes)} bytes` },
+    rows: [
+      ['Content', sample],
+      ['To', 'Your silent address'],
+      ['Network fees', btcStr(preview.fee) + ' BTC', `${feeRate} sat/vB`],
+      ['Stays with the inscriptions', `${fmt(preview.postage)} sats`],
+      ['Total', btcStr(preview.fee + preview.postage) + ' BTC', dollars(preview.fee + preview.postage)],
+    ],
+    note: `Requested by ${site}. Only confirm if you started this.`,
+    run: async (status) => {
+      const request = build(); status('Broadcasting…');
+      await broadcast(request.commit.hex);
+      await finishSend({ txid: request.commit.txid, fee: request.commit.fee, inputs: request.commit.inputs }, 'inscribe', request.fee);
+      const failed = [];
+      for (const reveal of request.reveals) {
+        let sent = false;
+        for (let attempt = 0; attempt < 3 && !sent; attempt++) {
+          try { await broadcast(reveal.hex); sent = true; }
+          catch { await new Promise((resolve) => setTimeout(resolve, 1500)); }
+        }
+        if (!sent) failed.push(reveal);
+      }
+      if (failed.length) {
+        S.state.revealsToSend = [...(S.state.revealsToSend || []), ...failed.map((reveal) => ({ txid: reveal.txid, hex: reveal.hex, at: Date.now() }))];
+        await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
+      }
+      done({ result: { commitTxid: request.commit.txid, inscriptionIds: request.inscriptionIds, pendingReveals: failed.length } }, failed.length ? 'Sent · some steps retry later' : 'Inscribed ✓');
+    },
+  });
+  box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' });
+}
+
+async function dappProof(done, site, cancel) {
+  const title = 'Proof request';
+  if (!(await connectedSites()).includes(dappReq.origin)) return dappFail(done, title, 'Connect this site first.');
+  if (!S.state || !Array.isArray(S.state.coins)) return dappFail(done, title, 'Your wallet has not finished syncing yet. Open the shhhhh wallet, wait until it says Synced, then try again.');
+  const { tick, challenge } = dappReq.params || {};
+  if (typeof tick !== 'string' || !/^[a-z0-9]{4,6}$/i.test(tick) || typeof challenge !== 'string' || !/^[0-9a-f]{32,64}$/.test(challenge)) return dappFail(done, title, 'The site sent an invalid request.');
+  await Promise.race([refreshDeposit().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 6000))]);
+  const normalized = tick.toLowerCase();
+  const matches = (token) => String(token.tick).toLowerCase() === normalized;
+  const held = Object.entries((S.state && S.state.brc20ByAddress) || {})
+    .map(([address, tokens]) => ({ address, token: tokens.find(matches) }))
+    .filter((item) => item.token && Number(item.token.balance) > 0)
+    .map((item) => ({ ...item, amount: Number(item.token.balance), coin: S.state.coins.find((coin) => coin.address === item.address && coin.tweak) }))
+    .filter((item) => item.coin)
+    .concat(depositTokens().filter((token) => matches(token) && Number(token.balance) > 0).map((token) => ({ address: S.wallet.deposit.address, amount: Number(token.balance), deposit: true })));
+  if (!held.length) return dappFail(done, title, `This wallet holds no ${tick} yet, or has not found it. Open the wallet, let it sync, then try again.`);
+  const total = held.reduce((sum, item) => sum + item.amount, 0);
+  return gate([
+    h('h2', {}, `Prove you hold ${tick}`),
+    h('div', { class: 'rv-hero' }, h('b', {}, `${fmt(total)} ${tick}`), h('small', {}, held.length === 1 ? 'on 1 address' : `on ${held.length} addresses`)),
+    h('p', { class: 'fine' }, `${site} asks this wallet to prove it holds ${tick}. It will see the ${held.length === 1 ? 'address' : held.length + ' addresses'} holding it and can link ${held.length === 1 ? 'it' : 'them'} to you. Nothing is spent and nothing can be moved.`),
+  ], [
+    h('button', { class: 'main pill-btn', onclick: () => {
+      const message = (address) => tagged('shhhhh/proof', new TextEncoder().encode([dappReq.origin, normalized, challenge, address].join('\n')));
+      const proofs = held.map((item) => ({
+        address: item.address,
+        sig: signMsg(item.deposit ? S.wallet.deposit.priv : outputPrivKey(S.wallet.bSpend, item.coin.tweak), message(item.address), crypto.getRandomValues(new Uint8Array(32))),
+      }));
+      done({ result: { tick: normalized, sp1: S.wallet.address, proofs } }, 'Proof sent ✓');
+    } }, 'Sign proof'),
+    cancel,
+  ]);
+}
+
+async function dappStake(done, site) {
+  const unstake = dappReq.method === 'unstake';
+  const title = unstake ? 'Unstake request' : 'Stake request';
+  if (dappReq.origin !== DAPP_STAKE_ORIGIN) return dappFail(done, title, 'Staking works only from The Anchorage on this computer.');
+  if (!(await connectedSites()).includes(dappReq.origin)) return dappFail(done, title, 'Connect this site first.');
+  if (!S.wallet.stake || !S.wallet.deposit) return dappFail(done, title, 'Lock and unlock the wallet once, then try again.');
+  if (!S.state || !Array.isArray(S.state.coins)) return dappFail(done, title, 'Your wallet has not finished syncing yet. Open the shhhhh wallet, wait until it says Synced, then try again.');
+  const { tick, amt, unlock } = dappReq.params || {};
+  if (typeof tick !== 'string' || !/^[a-z0-9]{4,6}$/i.test(tick) || !Number.isInteger(amt) || amt < MIN_STAKE || !Number.isInteger(unlock)) return dappFail(done, title, 'The site sent an invalid stake.');
+  let height = S.state.height || 0;
+  try { height = await getTip(); } catch {}
+  if (!unstake && (unlock < height + 25 * BLOCKS_PER_DAY || unlock > height + 370 * BLOCKS_PER_DAY)) return dappFail(done, title, 'The site sent an invalid stake.');
+  if (unstake && height < unlock) return dappFail(done, title, `Still locked until block ${fmt(unlock)}.`);
+  const target = stakeTarget(S.wallet.stake.xonly, unlock);
+  if (!(await prepareDapp(done, title))) return;
+  let rate = 2; try { rate = (await getFees()).normal; } catch {}
+  let holder = null;
+  if (!unstake) {
+    const choices = holders(tick);
+    holder = choices.find((item) => item.available >= amt);
+    if (!holder) return dappFail(done, title, `At most ${fmt(choices.length ? choices[0].available : 0)} ${tick} can be staked in one go.`);
+    if (!holder.coin) return dappFail(done, title, 'token address not found in this wallet');
+  }
+  const nonce = Date.now();
+  const holderXonly = unstake ? target.xonly : holder.coin.xonly;
+  const build = () => buildInscribeTransfer({ wallet: S.wallet, utxos: walletCoins(), holderXonly, tick, amt, feeRate: rate, changeAddress: S.wallet.changeAddress, nonce });
+  let preview;
+  try { preview = build(); } catch (e) { return dappFail(done, title, friendly(e.message)); }
+  const firstFee = preview.commit.fee + preview.commit.outputs.find((output) => output.raw).value - preview.postage;
+  const secondFee = Math.ceil((unstake ? 170 : vsizeOf(2, ['p2tr', 'p2tr'])) * rate);
+  const days = Math.max(1, Math.round((unlock - height) / BLOCKS_PER_DAY));
+  const box = h('div', { class: 'sheet dapp' }); screen(box);
+  reviewIn(box, {
+    title: (unstake ? 'Unstake for ' : 'Stake for ') + site,
+    cta: unstake ? 'Confirm & unstake' : 'Confirm & stake',
+    hero: { big: `${fmt(amt)} ${tick}`, sub: unstake ? 'back to your wallet' : `locked for ~${days} days` },
+    rows: [
+      unstake ? ['From', target.address] : ['Lock address', target.address],
+      ['Unlock block', fmt(unlock)],
+      ...(unstake ? [['To', S.wallet.deposit.address]] : []),
+      ['Step 1 fee (inscribe, now)', `${btcStr(firstFee)} BTC · ${rate} sat/vB`],
+      ['Goes with the tokens', `${preview.postage} sats`],
+      ['Step 2 fee (send, later)', `~${btcStr(secondFee)} BTC`, 'estimate, at today’s fee'],
+      ['Total', `~${btcStr(firstFee + preview.postage + secondFee)} BTC`, dollars(firstFee + preview.postage + secondFee)],
+    ],
+    note: unstake
+      ? 'After 1 confirmation, tap Complete on the home screen: the tokens come back to your deposit address.'
+      : 'Only your wallet can open this lock, and only after the unlock block. After 1 confirmation, tap Complete on the home screen to send the tokens there.',
+    run: async (status) => {
+      const request = build(); status('Broadcasting…');
+      await broadcast(request.commit.hex); await broadcast(request.reveal.hex);
+      const pending = { tick, amt: String(amt), nonce, inscriptionId: request.inscriptionId, revealTxid: request.reveal.txid, commitTxid: request.commit.txid, postage: request.postage, at: Date.now() };
+      if (unstake) Object.assign(pending, { to: S.wallet.deposit.address, holder: { lock: true, unlock, xonly: target.xonly } });
+      else Object.assign(pending, { to: target.address, stake: { unlock }, holder: holder.deposit ? { deposit: true, xonly: holder.coin.xonly } : { txid: holder.coin.txid, vout: holder.coin.vout, xonly: holder.coin.xonly, tweak: holder.coin.tweak } });
+      S.state.pending = [...(S.state.pending || []), pending];
+      if (!unstake) S.state.stakes = [...(S.state.stakes || []), { tick, amt: String(amt), unlock, address: target.address, at: Date.now() }];
+      await finishSend({ txid: request.commit.txid, fee: request.commit.fee, inputs: request.commit.inputs }, 'brc20-prepare', request.commit.fee);
+      done({ result: { lockAddress: target.address, unlock, inscriptionId: request.inscriptionId, revealTxid: request.reveal.txid, commitTxid: request.commit.txid } }, unstake ? 'Unstake started ✓' : 'Stake started ✓');
+    },
+  });
+  box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' });
+}
+
+async function dappMarket(done, site) {
+  const title = 'Market request';
+  if (!(await prepareDapp(done, title))) return;
+  if (!S.wallet.deposit) return dappFail(done, title, 'Lock and unlock the wallet once, then try again.');
+  const params = dappReq.params || {};
+  const box = h('div', { class: 'sheet dapp' });
+  const showItem = (id) => { const heading = box.querySelector('h3'); if (heading) heading.after(inscView(id, true)); };
+  const inscriptionCoin = (id, outpoint = null) => {
+    const item = view().insc.concat(view().hiddenInsc).find((candidate) => candidate.id === id && (!outpoint || `${candidate.coin.txid}:${candidate.coin.vout}` === outpoint));
+    return item && walletCoins().find((coin) => coin.txid === item.coin.txid && coin.vout === item.coin.vout && Array.isArray(coin.inscriptions || item.coin.inscriptions));
+  };
+
+  if (dappReq.method === 'myItems') {
+    const ids = Array.isArray(params.ids) ? params.ids.map(String).filter((id) => /^[0-9a-f]{64}i\d{1,7}$/.test(id)) : [];
+    if (!ids.length || ids.length > 10000) return dappFail(done, title, 'The site sent a bad item list.');
+    const wanted = new Set(ids);
+    const owned = [...new Set(view().insc.concat(view().hiddenInsc).map((item) => item.id).filter((id) => wanted.has(id)))];
+    return gate([
+      h('h2', {}, 'Show your items'),
+      h('p', { class: 'fine' }, `${site} asks which of its ${ids.length === 1 ? 'item' : ids.length + ' items'} you hold. It learns only that: ${owned.length === 1 ? '1 item' : owned.length + ' items'}. Nothing else about your wallet.`),
+    ], [
+      h('button', { class: 'main pill-btn', onclick: () => done({ result: { owned } }, 'Shared ✓') }, 'Show my items'),
+      h('button', { class: 'textbtn', onclick: () => done({ error: 'Request rejected' }) }, 'Cancel'),
+    ]);
+  }
+
+  if (dappReq.method === 'listForSale') {
+    const id = String(params.inscriptionId || ''), price = params.price;
+    if (!/^[0-9a-f]{64}i\d{1,7}$/.test(id)) return dappFail(done, title, 'The site sent a bad inscription id.');
+    if (!Number.isInteger(price) || price < MIN_PRICE || price > MAX_PRICE) return dappFail(done, title, `The price must be at least ${fmt(MIN_PRICE)} sats.`);
+    const coin = inscriptionCoin(id), creator = Math.floor(price * ROYALTY_BPS / 10000);
+    if (!coin) return dappFail(done, title, 'This inscription is not in your wallet (or it is not confirmed yet).');
+    const siblings = view().insc.concat(view().hiddenInsc).filter((item) => item.coin.txid === coin.txid && item.coin.vout === coin.vout && item.id !== id);
+    if (siblings.length) return dappFail(done, title, 'This coin holds more than one inscription: selling it would sell them all. Not supported yet.');
+    screen(box);
+    reviewIn(box, {
+      title: 'List for sale', cta: 'Sign & list', hero: { big: btcStr(price) + ' BTC', sub: dollars(price) },
+      rows: [
+        ['Inscription', short(id, 10, 6)],
+        ['You receive', btcStr(price - creator) + ' BTC', 'the buyer pays the network fee'],
+        ['Creator', btcStr(creator) + ' BTC', ROYALTY_BPS / 100 + '% of the price'],
+        ['Paid to', S.wallet.deposit.address],
+        ...(coin.value > 1000 ? [['Goes with it', `${fmt(coin.value)} sats`, 'the whole coin holding the inscription']] : []),
+      ],
+      note: `${site} gets a signed offer: anyone can buy this inscription for this price. Cancel on the market for free; the offer fully stops working once the inscription moves.`,
+      run: async () => done({ result: { offer: createOffer({ coin, inscriptionId: id, price, payTo: S.wallet.deposit.address }) } }, 'Listed ✓'),
+    });
+    showItem(id); box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' }); return;
+  }
+
+  if (dappReq.method === 'cancelListing') {
+    const offer = params.offer;
+    try { verifyOffer(offer); } catch (e) { return dappFail(done, title, 'The site sent a bad listing: ' + e.message); }
+    const coin = walletCoins().find((item) => item.txid === offer.txid && item.vout === offer.vout && item.xonly === offer.xonly);
+    if (!coin) return dappFail(done, title, 'This listing is not from this wallet.');
+    screen(box);
+    reviewIn(box, {
+      title: 'Cancel listing', cta: 'Cancel listing', hero: { big: btcStr(offer.price) + ' BTC', sub: 'listed price' },
+      rows: [['Inscription', short(offer.inscriptionId, 10, 6)]],
+      note: 'Free: the market removes your offer. For full safety (someone may have copied it), send the inscription to yourself.',
+      run: async () => done({ result: { inscriptionId: offer.inscriptionId, sig: cancelOffer(offer, coin.priv) } }, 'Listing cancelled ✓'),
+    });
+    showItem(offer.inscriptionId); box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' }); return;
+  }
+
+  const offer = params.offer, feeRate = params.feeRate;
+  try { verifyOffer(offer); } catch (e) { return dappFail(done, title, 'The site sent a bad listing: ' + e.message); }
+  if (!(typeof feeRate === 'number' && feeRate >= 0.1 && feeRate <= 500)) return dappFail(done, title, 'The site asked for an invalid fee rate.');
+  try {
+    const [outspend] = await getOutspends([`${offer.txid}:${offer.vout}`]);
+    if (!outspend || !outspend.unspent) return dappFail(done, title, 'This item was already sold or moved.');
+    if (!(outspend.confirmations > 0)) return dappFail(done, title, 'The seller’s coin is not confirmed yet. Try again after the next block.');
+    const output = Transaction.fromRaw(hexToBytes(await getTxHex(offer.txid)), { allowUnknownOutputs: true, allowUnknownInputs: true, disableScriptCheck: true }).getOutput(offer.vout);
+    if (bytesToHex(output.script) !== '5120' + offer.xonly || Number(output.amount) !== offer.value) return dappFail(done, title, 'The listing does not match the blockchain.');
+    const ord = await getOutputInscriptions(`${offer.txid}:${offer.vout}`);
+    if (!ord || !(ord.inscriptions || []).includes(offer.inscriptionId)) return dappFail(done, title, 'The seller’s coin does not hold this inscription.');
+    if (ord.inscriptions.length > 1) return dappFail(done, title, 'The seller’s coin holds more than one inscription. Not supported yet.');
+    if (ord.runes && Object.keys(ord.runes).length) return dappFail(done, title, 'The seller’s coin also holds runes. Not supported yet.');
+  } catch (e) { return dappFail(done, title, 'Could not check the listing right now: ' + friendly(e.message)); }
+
+  const build = () => buildPurchase({ wallet: S.wallet, utxos: walletCoins(), offer, feeRate });
+  let preview;
+  try { preview = build(); }
+  catch (e) {
+    if (e.message !== 'NEED_PREPARE') return dappFail(done, title, friendly(e.message));
+    const prepare = () => buildSend({ utxos: walletCoins(), recipients: [{ address: S.wallet.address, value: PREPARE_COIN_VALUE }, { address: S.wallet.address, value: PREPARE_COIN_VALUE }], feeRate, changeAddress: S.wallet.changeAddress });
+    let tx; try { tx = prepare(); } catch (error) { return dappFail(done, title, friendly(error.message)); }
+    screen(box);
+    reviewIn(box, {
+      title: 'One step before buying', cta: 'Prepare my wallet', hero: { big: 'Prepare to buy', sub: 'one time' },
+      rows: [['What', 'Splits your BTC into 3 coins (stays in your wallet)'], ['Network fee', btcStr(tx.fee) + ' BTC', `${feeRate} sat/vB`]],
+      note: 'A purchase needs 3 separate coins in your wallet. After 1 confirmation (about 10 minutes), press Buy again.',
+      run: async (status) => { const request = prepare(); status('Broadcasting…'); const { txid } = await broadcast(request.hex); await finishSend({ ...request, txid }, 'prepare', request.fee); done({ error: 'PREPARING ' + txid }, 'Prepared ✓ Buy again after 1 confirmation'); },
+    });
+    box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' }); return;
+  }
+  screen(box);
+  reviewIn(box, {
+    title: 'Buy from ' + site, cta: 'Confirm & buy', hero: { big: btcStr(offer.price) + ' BTC', sub: dollars(offer.price) },
+    rows: [
+      ['Inscription', short(offer.inscriptionId, 10, 6)], ['To', 'Your silent address'], ['Seller is paid', offer.payTo],
+      ...(preview.royalty ? [['Creator', btcStr(preview.royalty) + ' BTC', 'included in the price']] : []),
+      ['Network fee', btcStr(preview.fee) + ' BTC', `${feeRate} sat/vB`], ['Total', btcStr(offer.price + preview.fee) + ' BTC', dollars(offer.price + preview.fee)],
+    ],
+    note: 'One transaction: you pay the price, you get the inscription. Checked on the blockchain just now.',
+    run: async (status) => { const request = build(); status('Broadcasting…'); const { txid } = await broadcast(request.hex); await finishSend({ ...request, txid }, 'buy', offer.price + request.fee, { inscriptionId: offer.inscriptionId }); done({ result: { txid } }, 'Bought ✓'); },
+  });
+  showItem(offer.inscriptionId); box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' });
 }
 
 // ---------------------------------------------------------------- auto-lock
@@ -303,6 +611,7 @@ const ICONS = {
   copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="9" cy="9" r="2"/><path d="m21 15-4.5-4.5L5 21"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/>',
   pen: '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="m13.5 6.5 4 4"/>',
   key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3"/><path d="m16 7 3 3"/><path d="m18 5 2 2"/>',
   save: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
@@ -847,9 +1156,20 @@ async function completeTransfer(x) {
       x = { ...x, to: dest };
     }
     const all = walletCoins();
-    const coin = { txid: x.revealTxid, vout: x.vout || 0, value: x.postage, xonly: x.holder.xonly, priv: x.holder.deposit ? S.wallet.deposit.priv : outputPrivKey(S.wallet.bSpend, x.holder.tweak), inscribed: true };
+    const locked = !!(x.holder && x.holder.lock);
+    if (locked) {
+      let height = 0; try { height = await getTip(); } catch {}
+      if (height < x.holder.unlock) return fail(`Still locked until block ${fmt(x.holder.unlock)}.`);
+    }
+    const coin = {
+      txid: x.revealTxid, vout: x.vout || 0, value: x.postage, xonly: x.holder.xonly,
+      priv: locked ? undefined : x.holder.deposit ? S.wallet.deposit.priv : outputPrivKey(S.wallet.bSpend, x.holder.tweak),
+      inscribed: true,
+    };
     const fees = await getFees().catch(() => ({ normal: 2 }));
-    const build = () => buildSendInscription({ utxos: [...all.filter((c) => !(c.txid === coin.txid && c.vout === coin.vout)), coin], inscribed: coin, to: x.to, feeRate: fees.normal, changeAddress: S.wallet.changeAddress });
+    const build = () => locked
+      ? buildUnstake({ stake: S.wallet.stake, unlock: x.holder.unlock, lockCoin: coin, utxos: all.filter((c) => !c.inscribed), to: S.wallet.deposit.address, changeTo: S.wallet.deposit.address, feeRate: fees.normal })
+      : buildSendInscription({ utxos: [...all.filter((c) => !(c.txid === coin.txid && c.vout === coin.vout)), coin], inscribed: coin, to: x.to, feeRate: fees.normal, changeAddress: S.wallet.changeAddress });
     let preview;
     try { preview = build(); }
     catch (e) {
@@ -866,7 +1186,11 @@ async function completeTransfer(x) {
         const { txid } = await broadcast(tx.hex);
         S.state.pending = (S.state.pending || []).filter((p) => p.inscriptionId !== x.inscriptionId);
         S.state.waiting = (S.state.waiting || []).filter((p) => p.inscriptionId !== x.inscriptionId);
-        await finishSend({ ...tx, txid }, 'brc20', tx.fee, { tick: x.tick, amt: x.amt, from: x.holder.deposit ? S.wallet.deposit.address : taprootAddress(x.holder.xonly) });
+        if (locked) S.state.stakes = (S.state.stakes || []).filter((stake) => stake.unlock !== x.holder.unlock);
+        await finishSend({ ...tx, txid }, 'brc20', tx.fee, {
+          tick: x.tick, amt: x.amt,
+          from: x.holder.deposit ? S.wallet.deposit.address : locked ? stakeTarget(S.wallet.stake.xonly, x.holder.unlock).address : taprootAddress(x.holder.xonly),
+        });
         close(); toast(`Sent ${x.amt} ${x.tick} ✓`); render(); setTimeout(sync, 4000);
       } });
   } catch (e) { fail(friendly(e.message || String(e))); }
@@ -929,7 +1253,17 @@ async function sync(quiet = false) {
     const brc20All = !!S.brc20All; S.brc20All = false;
     const r = await syncWallet(S.wallet, { birthday: S.secret.birthday || 0, prev, keep, fromStart: !!(prev && prev.rescan), signal: syncAbort.signal, brc20All,
       resume: prev ? null : S.partial || null,
-      onCheckpoint: async (snap) => { if (gen !== syncGen) return; snap.sent = (carry && carry.sent) || []; snap.pending = (carry && carry.pending) || []; snap.hidden = (carry && carry.hidden) || []; snap.moves = (carry && carry.moves) || []; S.state = snap; S.partial = null; await kv.del(LS_PARTIAL); await kv.set(LS_STATE, await K.sealJSON(S.stateKey, snap)); },
+      onCheckpoint: async (snap) => {
+        if (gen !== syncGen) return;
+        snap.sent = (carry && carry.sent) || [];
+        snap.pending = (carry && carry.pending) || [];
+        snap.hidden = (carry && carry.hidden) || [];
+        snap.moves = (carry && carry.moves) || [];
+        snap.stakes = (carry && carry.stakes) || [];
+        snap.revealsToSend = (carry && carry.revealsToSend) || [];
+        S.state = snap; S.partial = null;
+        await kv.del(LS_PARTIAL); await kv.set(LS_STATE, await K.sealJSON(S.stateKey, snap));
+      },
       onBrc20Save: async (b) => { if (gen !== syncGen || !S.state || !S.state.coins) return; Object.assign(S.state, b); await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state)); if (tab === 'home' && !document.querySelector('.sheet-bg')) home(); },
       onChunk: async (part) => { if (gen !== syncGen) return; S.partial = part; await kv.set(LS_PARTIAL, await K.sealJSON(S.stateKey, part)); },
       onStep: (st, p) => { if (gen !== syncGen || quiet) return; S.syncStep = st; S.syncPct = p; fillSync($('sync')); } });
@@ -939,7 +1273,16 @@ async function sync(quiet = false) {
     // sends the scan cannot see (no change came back, e.g. Max): ask the node whether they are confirmed
     for (const x of r.sent.filter((x) => !x.height).slice(0, 20)) { try { const st = await getTxStatus(x.txid); if (st.height) x.height = st.height; } catch {} }
     for (const x of r.sent) if (!r.txs.some((t) => t.txid === x.txid)) for (const c of r.coins) if (x.inputs && x.inputs.includes(`${c.txid}:${c.vout}`)) c.spent = true;
-    r.pending = (carry && carry.pending) || []; r.hidden = (carry && carry.hidden) || []; r.moves = ((carry && carry.moves) || []).map((m) => (!m.doneAt && r.txs.some((t) => t.txid === m.txid && t.height > 0) ? { ...m, doneAt: Date.now() } : m)).filter((m) => !m.doneAt || Date.now() - m.doneAt < 60000);
+    r.pending = (carry && carry.pending) || [];
+    r.hidden = (carry && carry.hidden) || [];
+    r.stakes = (carry && carry.stakes) || [];
+    r.moves = ((carry && carry.moves) || []).map((m) => (!m.doneAt && r.txs.some((t) => t.txid === m.txid && t.height > 0) ? { ...m, doneAt: Date.now() } : m)).filter((m) => !m.doneAt || Date.now() - m.doneAt < 60000);
+    r.revealsToSend = [];
+    for (const reveal of (carry && carry.revealsToSend) || []) {
+      const status = await getTxStatus(reveal.txid).catch(() => ({}));
+      if (status.found || Date.now() - reveal.at > 2 * 86400000) continue;
+      try { await broadcast(reveal.hex); } catch { r.revealsToSend.push(reveal); }
+    }
     S.state = r; S.partial = null; kv.del(LS_PARTIAL);
     await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
   } catch (x) {
@@ -992,13 +1335,15 @@ function settings() {
       srow('lock', 'Auto-lock', lockLabel(autoLockMin()), 'autolock'),
       srow('key', 'Recovery phrase', null, 'phrase')),
     hasSidePanel() ? h('div', { class: 'sgroup' }, 'Extension') : null,
-    hasSidePanel() ? h('div', { class: 'slist' }, srow('panel', 'Side panel', S.panelMode ? 'On' : 'Off', 'sidepanel')) : null,
+    hasSidePanel() ? h('div', { class: 'slist' },
+      srow('panel', 'Side panel', S.panelMode ? 'On' : 'Off', 'sidepanel'),
+      srow('globe', 'Connected sites', null, 'sites')) : null,
     h('div', { class: 'sgroup' }, 'Sync'),
     h('div', { class: 'slist' },
       srow('coin', 'Find missing tokens', null, 'brc20'),
       srow('refresh', 'Rescan wallet', null, 'rescan')),
     h('div', { class: 'slist' }, srow('trash', 'Remove wallet', null, 'remove', true)),
-    h('p', { class: 'fine center' }, 'BIP352 silent payments · keys stay in this browser')]);
+    h('p', { class: 'fine center' }, 'BIP352 silent payments · spending keys stay in this browser')]);
 }
 // one settings page: back bar, big icon, title, one-line description, then its content
 function spageView(ic, title, desc, body, danger = false) {
@@ -1051,6 +1396,21 @@ const PAGES = {
     } }, h('span', { class: 'srow-t' }, h('b', {}, label), h('small', {}, sub)), S.panelMode === on ? h('span', { class: 'opt-ck' }, icon('check', 18)) : null);
     spageView('panel', 'Side panel', 'Choose what the shhhhh icon in the toolbar opens.', [
       h('div', { class: 'slist' }, opt(false, 'Popup', 'Small window, closes when you click away'), opt(true, 'Side panel', 'Stays open on the right while you browse'))]);
+  },
+  async sites() {
+    const sites = await connectedSites();
+    const save = async (next, message) => {
+      await chrome.storage.local.set({ shhhhhSites: next });
+      toast(message); PAGES.sites();
+    };
+    spageView('globe', 'Connected sites', 'Sites you allowed to see your address and ask for payments. Every payment still needs your password.', [
+      sites.length
+        ? h('div', { class: 'slist' }, sites.map((site) => h('div', { class: 'srow' },
+            h('span', { class: 'srow-t' }, h('b', {}, site.replace(/^https?:\/\//, ''))),
+            h('button', { class: 'link', onclick: () => save(sites.filter((item) => item !== site), 'Disconnected') }, 'Disconnect'))))
+        : h('div', { class: 'empty' }, h('div', { class: 'big-ic' }, icon('globe', 28)), h('b', {}, 'No sites connected yet.')),
+      sites.length ? h('button', { class: 'textbtn', onclick: () => save([], 'All sites disconnected') }, 'Disconnect all') : null,
+    ].filter(Boolean));
   },
   phrase() {
     const e = h('div', { class: 'err', hidden: true }), out = h('div');

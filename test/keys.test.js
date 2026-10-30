@@ -20,6 +20,7 @@ ok(K.isValidMnemonic(K.newMnemonic()) && K.newMnemonic(24).split(' ').length ===
 console.log('abandon…about sp1:', w.address);
 // BIP86 official test vector: "abandon … about", m/86'/0'/0'/0/0
 ok(w.deposit.address === 'bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr', 'deposit address = BIP86 test vector');
+ok(w.stake.xonly === 'e2524c54ed4b3e27c4ef56589b7e4e428f3c87685618aeefdcdc685246c34ba0', 'dedicated stake key derivation is stable');
 
 // 2. vault round trip
 const vault = await K.lockVault({ mnemonic: M, birthday: 969600 }, 'correct horse');

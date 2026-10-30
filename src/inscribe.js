@@ -7,11 +7,12 @@
 import { Transaction, SigHash } from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1';
 import { bytesToHex, hexToBytes, concatBytes, numberToBytesBE } from '@noble/curves/abstract/utils';
-import { Point, N, tagged } from './sp.js';
+import { Point, N, tagged, createOutputs } from './sp.js';
 import { buildSend, DUST } from './send.js';
 
 export const POSTAGE = 546;                                  // value of the inscription output (UniSat-compatible)
 export const BRC20_CT = 'text/plain;charset=utf-8';
+export const MAX_INSCRIPTION_BYTES = 60000;
 const enc = new TextEncoder();
 
 function push(b) {
@@ -42,10 +43,16 @@ export function commitKey(bSpend, nonce) {
 export function commitTarget(k, contentType, body) {
   const P = Point.BASE.multiply(k), Px = P.toRawBytes(true).slice(1);
   const script = inscriptionScript(Px, contentType, body);
-  const t = toInt(tagged('TapTweak', Px, leafHash(script)));
+  const t = toInt(tagged('TapTweak', Px, leafHash(script))) % N;
   const Q = Point.fromHex(concatBytes(new Uint8Array([2]), Px)).add(Point.BASE.multiply(t));
   const Qb = Q.toRawBytes(true);
-  return { script, outScript: concatBytes(new Uint8Array([0x51, 0x20]), Qb.slice(1)), controlBlock: concatBytes(new Uint8Array([0xc0 | (Qb[0] & 1)]), Px) };
+  const evenK = P.toAffine().y % 2n === 0n ? k : N - k;
+  return {
+    script,
+    outScript: concatBytes(new Uint8Array([0x51, 0x20]), Qb.slice(1)),
+    controlBlock: concatBytes(new Uint8Array([0xc0 | (Qb[0] & 1)]), Px),
+    qPriv: (evenK + t) % N,
+  };
 }
 export const revealVsize = (script) => Math.ceil(10.5 + 41 + 43 + (1 + 1 + 64 + cs(script.length).length + script.length + 1 + 33) / 4);
 
@@ -77,4 +84,43 @@ export function buildInscribeTransfer({ wallet, utxos, holderXonly, tick, amt, f
                                toScript: hexToBytes('5120' + holderXonly) });
   if (reveal.vsize * feeRate > revealFee + 1) throw new Error('reveal fee estimate too low (internal check)');
   return { commit, reveal, nonce, inscriptionId: reveal.inscriptionId, holderXonly, postage: POSTAGE };
+}
+
+// General inscription request: one commit transaction and one independent reveal per item.
+export function buildInscribe({ wallet, utxos, items, feeRate, changeAddress, to, network, nonce }) {
+  if (!items.length || items.length > 25) throw new Error('between 1 and 25 inscriptions at a time');
+  for (const item of items) if (!item.body.length || item.body.length > MAX_INSCRIPTION_BYTES) throw new Error(`each inscription must be 1 to ${MAX_INSCRIPTION_BYTES} bytes`);
+  const keys = items.map((_, index) => commitKey(wallet.bSpend, `${nonce}:${index}`));
+  const targets = items.map((item, index) => commitTarget(keys[index], item.contentType, item.body));
+  const values = targets.map((target) => POSTAGE + Math.ceil(revealVsize(target.script) * feeRate) + 1);
+  const commit = buildSend({
+    utxos,
+    recipients: targets.map((target, index) => ({ address: { script: target.outScript }, value: values[index] })),
+    feeRate,
+    changeAddress,
+    network,
+  });
+  const reveals = targets.map((target, index) => {
+    const toScript = typeof to === 'string'
+      ? hexToBytes('5120' + createOutputs([{ txid: commit.txid, vout: index, priv: target.qPriv, taproot: true }], [to])[0].xonly)
+      : to.script;
+    const reveal = buildReveal({
+      commitTxid: commit.txid,
+      commitVout: index,
+      commitValue: values[index],
+      k: keys[index],
+      contentType: items[index].contentType,
+      body: items[index].body,
+      toScript,
+    });
+    if (reveal.vsize * feeRate > values[index] - POSTAGE + 1) throw new Error('reveal fee estimate too low (internal check)');
+    return reveal;
+  });
+  const revealFees = values.reduce((sum, value) => sum + value - POSTAGE, 0);
+  return {
+    commit, reveals, nonce,
+    postage: POSTAGE * items.length,
+    fee: commit.fee + revealFees,
+    inscriptionIds: reveals.map((reveal) => reveal.inscriptionId),
+  };
 }

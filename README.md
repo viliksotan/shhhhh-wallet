@@ -1,7 +1,7 @@
 # shhhhh wallet
 
 A private Bitcoin wallet for Chrome, built on **silent payments** ([BIP352](https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki)).
-Hold and send BTC, BRC-20 tokens and inscriptions. Your keys never leave your browser.
+Hold and send BTC, BRC-20 tokens and inscriptions. Spending keys never leave your browser.
 
 Website: [shhhhh.site](https://shhhhh.site) · Privacy policy: [shhhhh.site/privacy](https://shhhhh.site/privacy)
 
@@ -10,8 +10,8 @@ Website: [shhhhh.site](https://shhhhh.site) · Privacy policy: [shhhhh.site/priv
 ## How it works
 
 - **One reusable address (sp1).** Every payment to you lands on a new, unlinkable taproot address.
-- **Keys stay local.** The 12-word phrase is created in the browser and stored encrypted with your password (AES-GCM, PBKDF2). Sync data is encrypted too.
-- **Finding payments.** Silent payments can only be found with the scan key, so the wallet asks a node running [Frigate](https://github.com/sparrowwallet/frigate) to scan for them. The scan key cannot spend; every candidate the node returns is checked again locally with your keys.
+- **Spending keys stay local.** The 12-word phrase is created in the browser and stored encrypted with your password (AES-GCM, PBKDF2). Sync data is encrypted too. The scan private key is shared with the selected scan node as described below; it cannot spend funds.
+- **Finding payments.** Silent payments can only be found with the scan key, so the wallet asks a node running [Frigate](https://github.com/sparrowwallet/frigate) to scan for them. The scan key cannot spend; every candidate the node returns is checked again locally with your keys. The selected node can nevertheless link incoming payments to this wallet, so it is part of the privacy trust model.
 - **Inscriptions and BRC-20.** Coins are checked with [ord](https://github.com/ordinals/ord) before they are ever used as fee money, so inscriptions are never spent by mistake. BRC-20 transfers use the usual two steps (inscribe the transfer to the holder address, then send it).
 - **Deposit address.** A normal BIP86 taproot address from the same 12 words, for exchanges and other wallets.
 
@@ -19,7 +19,7 @@ Website: [shhhhh.site](https://shhhhh.site) · Privacy policy: [shhhhh.site/priv
 
 | Path | What |
 |---|---|
-| `src/` | The wallet: UI (`app.js`), keys and vault (`keys.js`), BIP352 (`sp.js`, `scan.js`), sync (`node.js`), transactions (`send.js`, `inscribe.js`) |
+| `src/` | The wallet: UI (`app.js`), keys and vault (`keys.js`), BIP352 (`sp.js`, `scan.js`), sync (`node.js`), transactions (`send.js`, `inscribe.js`, `market.js`, `stake.js`) |
 | `web/` | The page shell |
 | `bridge/` | The small server between the wallet and Bitcoin Core, Frigate, ord and the BRC-20 indexer |
 | `tools/` | Build scripts and browser tests |
@@ -41,8 +41,10 @@ Load it in Chrome: `chrome://extensions` → Developer mode → **Load unpacked*
 node test/sp.test.js              # BIP352 vectors
 node test/scan.test.js
 node test/keys.test.js
+node test/features.test.js        # inscription, marketplace and staking builders
 node tools/dev-server.mjs &       # http://127.0.0.1:8362
-node tools/e2e.mjs                # browser test (Chrome)
+node tools/e2e.mjs                # full UI browser test (Chrome/Edge)
+node tools/ext-test.mjs           # extension + page API test (Chrome/Edge)
 ```
 
 Regtest tests (`test/*.regtest.mjs`) need `bitcoind` (and `ord` for inscriptions) on your PATH, or `BITCOIN_BIN` / `ORD_BIN`.
