@@ -12,6 +12,7 @@ import { buildSend, DUST } from './send.js';
 
 export const POSTAGE = 546;                                  // value of the inscription output (UniSat-compatible)
 export const BRC20_CT = 'text/plain;charset=utf-8';
+export const BRC2_TARGET_SCRIPT = hexToBytes('6a09425243323050524f47'); // OP_RETURN "BRC20PROG"
 export const MAX_INSCRIPTION_BYTES = 60000;
 const enc = new TextEncoder();
 
@@ -34,7 +35,39 @@ const leafHash = (script) => tagged('TapLeaf', new Uint8Array([0xc0]), cs(script
 const be32 = (n) => numberToBytesBE(n, 32);
 const toInt = (b) => BigInt('0x' + bytesToHex(b));
 
-export const brc20Transfer = (tick, amt) => enc.encode(JSON.stringify({ p: 'brc-20', op: 'transfer', tick, amt: String(amt) }));
+function brc20Amount(value) {
+  const amount = String(value ?? '').trim();
+  if (!/^\d+(\.\d+)?$/.test(amount) || Number(amount) <= 0) throw new Error('BRC-20 amount must be positive');
+  return amount;
+}
+export function normalizeBrc20Tick(value) {
+  // BRC-20 extensions distinguish ticker sizes by UTF-8 bytes, not by the
+  // JavaScript character count. Preserve non-ASCII tickers but normalize their
+  // Unicode representation; ASCII tickers remain case-insensitive.
+  const tick = String(value ?? '').trim().normalize('NFC').replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  const size = enc.encode(tick).length;
+  if (size < 4 || size > 6 || /[\u0000-\u001f\u007f]/.test(tick)) throw new Error('BRC-20 ticker must be 4, 5 or 6 UTF-8 bytes');
+  if (size === 6 && !/^[a-z0-9-]{6}$/.test(tick)) throw new Error('6-byte BRC-20 ticker must use only A-Z, 0-9 or dash');
+  return tick;
+}
+export const brc20TickerBytes = (value) => enc.encode(normalizeBrc20Tick(value)).length;
+export const brc20Mint = (tick, amt) => enc.encode(JSON.stringify({ p: 'brc-20', op: 'mint', tick: normalizeBrc20Tick(tick), amt: brc20Amount(amt) }));
+export const brc20Transfer = (tick, amt) => enc.encode(JSON.stringify({ p: 'brc-20', op: 'transfer', tick: normalizeBrc20Tick(tick), amt: brc20Amount(amt) }));
+
+function brc2Hex(value, label) {
+  const hex = String(value ?? '').trim();
+  if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(hex)) throw new Error(`${label} must be a non-empty 0x-prefixed even-length hex value`);
+  return '0x' + hex.slice(2).toLowerCase();
+}
+export const brc2Deploy = (data) => enc.encode(JSON.stringify({ p: 'brc20-prog', op: 'd', d: brc2Hex(data, 'deployment data') }));
+export function brc2Call({ contract, inscriptionId, data }) {
+  const target = String(contract || '').trim();
+  const parent = String(inscriptionId || '').trim();
+  if (!!target === !!parent) throw new Error('provide exactly one contract address or deployment inscription id');
+  if (target && !/^0x[0-9a-fA-F]{40}$/.test(target)) throw new Error('contract address must contain 20 bytes');
+  if (parent && !/^[0-9a-fA-F]{64}i\d{1,10}$/.test(parent)) throw new Error('deployment inscription id is invalid');
+  return enc.encode(JSON.stringify({ p: 'brc20-prog', op: 'c', ...(target ? { c: '0x' + target.slice(2).toLowerCase() } : { i: parent.toLowerCase() }), d: brc2Hex(data, 'call data') }));
+}
 export function commitKey(bSpend, nonce) {
   return toInt(tagged('shhhhh/commit', be32(bSpend), enc.encode(String(nonce)))) % (N - 1n) + 1n;
 }
@@ -123,4 +156,16 @@ export function buildInscribe({ wallet, utxos, items, feeRate, changeAddress, to
     fee: commit.fee + revealFees,
     inscriptionIds: reveals.map((reveal) => reveal.inscriptionId),
   };
+}
+
+// BRC2.0 deploy/call inscriptions are revealed directly to the protocol's
+// OP_RETURN output. Funding coin selection and every spendable change output
+// still use the silent wallet's normal private change path.
+export function buildBrc2Inscribe({ wallet, utxos, body, feeRate, changeAddress, network, nonce }) {
+  return buildInscribe({
+    wallet, utxos,
+    items: [{ contentType: BRC20_CT, body }],
+    feeRate, changeAddress, network, nonce,
+    to: { script: BRC2_TARGET_SCRIPT },
+  });
 }

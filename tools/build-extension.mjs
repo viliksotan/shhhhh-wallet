@@ -70,7 +70,7 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
       .then(() => send({ result: { disconnected: true } }), (e) => send({ error: String(e && e.message || e) }));
     return true;
   }
-  if (!['connect', 'sendBitcoin', 'inscribe', 'listForSale', 'cancelListing', 'buyListing', 'myItems', 'stake', 'unstake', 'proveHolding'].includes(msg.method)) { send({ error: 'Unknown request' }); return; }
+  if (!['connect', 'sendBitcoin', 'inscribe', 'listForSale', 'cancelListing', 'buyListing', 'myItems', 'stake', 'unstake', 'proveHolding', 'fairCommit', 'fairReveal'].includes(msg.method)) { send({ error: 'Unknown request' }); return; }
   if (msg.method === 'proveHolding' && !['http://127.0.0.1:8375', 'https://shroud.world'].includes(origin)) { send({ error: 'Proof of holding works only from The Cartographer on shroud.world' }); return; }
   if ((msg.method === 'stake' || msg.method === 'unstake') && origin !== 'http://127.0.0.1:8372') { send({ error: 'Staking works only from The Anchorage on this computer' }); return; }
   const req = { id: String(msg.id).slice(0, 64), method: msg.method, params: msg.params || {}, origin, tabId: sender.tab.id, at: Date.now() };
@@ -113,6 +113,8 @@ fs.writeFileSync(path.join(OUT, 'inpage.js'), `(() => {
     stake: (tick, amt, unlock) => call('stake', { tick, amt, unlock }),
     unstake: (tick, amt, unlock) => call('unstake', { tick, amt, unlock }),
     proveHolding: (tick, challenge) => call('proveHolding', { tick, challenge }),
+    fairCommit: (order) => call('fairCommit', { order }),
+    fairReveal: (commitment) => call('fairReveal', { commitment }),
   });
   window.dispatchEvent(new Event('shhhhh#initialized'));
 })();

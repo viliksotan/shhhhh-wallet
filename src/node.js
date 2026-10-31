@@ -7,6 +7,12 @@ import { txCandidates, matchOutput, taprootAddress } from './scan.js';
 import { CHANGE_LABEL } from './keys.js';
 
 export const NODE = 'https://node.shhhhh.site';
+// The local preview owns a small development order book so real list/cancel
+// flows can be exercised before the production bridge is deployed. All chain,
+// ord and broadcast calls still use NODE; only market book calls are local.
+export const MARKET_NODE = typeof location !== 'undefined' && /^(127\.0\.0\.1|localhost):8362$/.test(location.host)
+  ? `${location.origin}/api/node`
+  : NODE;
 export const TAPROOT_START = 709632;                        // nothing before Taproot can be a silent payment
 // shhhhh wallets are all new (restore is off): nothing can be older than the launch block. The node refuses earlier scans.
 export const MIN_START = 968000;
@@ -35,6 +41,10 @@ export const getBrc20 = (address, base = NODE) => j(`${base}/v1/brc20/${address}
 export const getTransferable = (address, tick, base = NODE) => j(`${base}/v1/brc20-transferable/${address}/${encodeURIComponent(tick)}`);
 export const getInscriptionInfo = (id, base = NODE) => j(`${base}/v1/ord/inscription/${id}`);
 export const contentUrl = (id, base = NODE) => `${base}/v1/ord/content/${id}`;
+export const getMarketListings = ({ cursor = 0, limit = 50 } = {}, base = MARKET_NODE) => j(`${base}/v1/market/listings?cursor=${encodeURIComponent(cursor)}&limit=${encodeURIComponent(limit)}`);
+export const listMarketOffer = (offer, base = MARKET_NODE) => j(`${base}/v1/market/list`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ offer }) });
+export const cancelMarketListing = (offer, sig, base = MARKET_NODE) => j(`${base}/v1/market/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ offer, sig }) });
+export const getMarketFeePolicy = (base = MARKET_NODE) => j(`${base}/v1/market/fee-policy`);
 
 // Frigate scan over WebSocket. Resolves with [{ height, txid, tweak }] once the scan is up to date (progress 1).
 export function frigateScan(wallet, start, { base = NODE, onProgress, signal } = {}) {

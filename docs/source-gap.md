@@ -56,6 +56,15 @@ buyListing, myItems, stake, unstake, proveHolding
 - Holding proofs use a domain-separated message and only run from the restricted proof origins.
 - The approval broker now serializes request reservations, preventing two tabs from overwriting
   the single approval slot.
+- The wallet now exposes its existing inscription builders through an integrated Bitcoin
+  inscription center for BRC-20 mint/transfer, BRC2.0 contract operations, text and image flows,
+  including 4/5/6-byte namespace rules, silent-change disclosure, fee and password review.
+- The interface defaults to English and adds a Settings language picker with 18 additional
+  languages. Unreviewed long-form copy falls back to English rather than using an unsafe runtime
+  translation service.
+- Fair Batch Mode adds signed commit/reveal orders, deterministic uniform-price clearing,
+  verified-stake square-root quotas, supply/price circuit breakers and an auditable coordinator.
+  This is new development in this fork rather than a claim about the unpublished package source.
 
 Before a public release, backend fee estimates and all service responses still need adversarial
 integration testing, the node endpoint should become configurable, and release artifacts should

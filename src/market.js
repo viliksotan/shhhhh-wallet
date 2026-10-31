@@ -10,11 +10,8 @@ export const OFFER_SIGHASH = SigHash.SINGLE_ANYONECANPAY;
 export const SELLER_INPUT_INDEX = 2;
 export const MIN_PRICE = 10000;
 export const MAX_PRICE = 2100000000000000;
-export const ROYALTY_BPS = 700;
 export const PREPARE_COIN_VALUE = 600;
-export const ROYALTY_SCRIPT = '51200b84faab41a56f2195f84706fa65b7605b28ab67c69d9b340a912ebbbcbb9c82';
 
-const LEGACY_MIN_PRICE = 1000;
 const SEQUENCE = 0xfffffffd;
 const PLACEHOLDER_SCRIPT = hexToBytes('512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798');
 const TX_OPTIONS = { allowUnknownOutputs: true, version: 2, lockTime: 0 };
@@ -27,8 +24,8 @@ const u32be = (n) => new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255
 const outpoint = (txid, vout) => concatBytes(hexToBytes(txid).reverse(), new Uint8Array([vout & 255, (vout >>> 8) & 255, (vout >>> 16) & 255, (vout >>> 24) & 255]));
 const compare = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; };
 
-export const royalty = (offer) => offer.v === 2 ? Math.floor(offer.price * ROYALTY_BPS / 10000) : 0;
-export const sellerProceeds = (offer) => offer.price - royalty(offer);
+export const royalty = () => 0;
+export const sellerProceeds = (offer) => offer.price;
 
 function payScript(address, network = NETWORK) {
   const decoded = Address(network).decode(address);
@@ -49,30 +46,50 @@ function offerDigest(offer, network = NETWORK) {
   return tx.preimageWitnessV1(SELLER_INPUT_INDEX, scripts, OFFER_SIGHASH, [0n, 0n, BigInt(offer.value)]);
 }
 
+function offerAuthDigest(offer) {
+  const canonical = {
+    v: offer.v, inscriptionId: offer.inscriptionId, txid: offer.txid, vout: offer.vout,
+    value: offer.value, xonly: offer.xonly, price: offer.price, payTo: offer.payTo, nonce: offer.nonce, sig: offer.sig,
+  };
+  return tagged('shhhhh/market-offer/v3', enc.encode(JSON.stringify(canonical)));
+}
+
 export function createOffer({ coin, inscriptionId, price, payTo, network = NETWORK }) {
   if (!Number.isInteger(price) || price < MIN_PRICE || price > MAX_PRICE) throw new Error(`price must be at least ${MIN_PRICE} sats`);
-  const offer = { v: 2, inscriptionId, txid: coin.txid, vout: coin.vout, value: coin.value, xonly: coin.xonly, price, payTo };
+  const nonce = bytesToHex(globalThis.crypto.getRandomValues(new Uint8Array(16)));
+  const offer = { v: 3, inscriptionId, txid: coin.txid, vout: coin.vout, value: coin.value, xonly: coin.xonly, price, payTo, nonce };
   const digest = offerDigest(offer, network);
   const sig = schnorr.sign(digest, coin.priv);
   if (!schnorr.verify(sig, digest, hexToBytes(coin.xonly))) throw new Error('offer signature check failed');
-  return { ...offer, sig: bytesToHex(concatBytes(sig, new Uint8Array([OFFER_SIGHASH]))) };
+  const signed = { ...offer, sig: bytesToHex(concatBytes(sig, new Uint8Array([OFFER_SIGHASH]))) };
+  const auth = schnorr.sign(offerAuthDigest(signed), coin.priv);
+  if (!schnorr.verify(auth, offerAuthDigest(signed), hexToBytes(coin.xonly))) throw new Error('offer authorization check failed');
+  return { ...signed, auth: bytesToHex(auth) };
 }
 
 export function verifyOffer(offer, network = NETWORK) {
-  if (!offer || (offer.v !== 1 && offer.v !== 2)) throw new Error('unknown offer format');
+  if (!offer || offer.v !== 3) throw new Error('unknown or unsafe offer format');
   if (!/^[0-9a-f]{64}$/.test(offer.txid) || !Number.isInteger(offer.vout) || offer.vout < 0 || offer.vout > 100000) throw new Error('bad outpoint');
   if (!/^[0-9a-f]{64}i\d{1,7}$/.test(offer.inscriptionId || '')) throw new Error('bad inscription id');
   if (!Number.isInteger(offer.value) || offer.value < 330 || offer.value > 1000000) throw new Error('bad coin value');
-  if (!Number.isInteger(offer.price) || offer.price < (offer.v === 2 ? MIN_PRICE : LEGACY_MIN_PRICE) || offer.price > MAX_PRICE) throw new Error('bad price');
-  if (!/^[0-9a-f]{64}$/.test(offer.xonly || '') || !/^[0-9a-f]{130}$/.test(offer.sig || '')) throw new Error('bad key or signature');
+  if (!Number.isInteger(offer.price) || offer.price < MIN_PRICE || offer.price > MAX_PRICE) throw new Error('bad price');
+  if (!/^[0-9a-f]{32}$/.test(offer.nonce || '')) throw new Error('bad offer nonce');
+  if (!/^[0-9a-f]{64}$/.test(offer.xonly || '') || !/^[0-9a-f]{130}$/.test(offer.sig || '') || !/^[0-9a-f]{128}$/.test(offer.auth || '')) throw new Error('bad key or signature');
   const sig = hexToBytes(offer.sig);
   if (sig[64] !== OFFER_SIGHASH) throw new Error('offer must be signed SINGLE|ANYONECANPAY');
   if (!schnorr.verify(sig.slice(0, 64), offerDigest(offer, network), hexToBytes(offer.xonly))) throw new Error('offer signature is not valid');
+  if (!schnorr.verify(hexToBytes(offer.auth), offerAuthDigest(offer), hexToBytes(offer.xonly))) throw new Error('offer authorization is not valid');
   return true;
 }
 
-const cancelDigest = (offer) => tagged('shhhhh/market-cancel', outpoint(offer.txid, offer.vout), enc.encode(offer.inscriptionId));
+const cancelDigest = (offer) => tagged('shhhhh/market-cancel/v2', offerAuthDigest(offer), hexToBytes(offer.auth));
 export const cancelOffer = (offer, priv) => bytesToHex(schnorr.sign(cancelDigest(offer), priv));
+export function verifyCancellation(offer, signature) {
+  verifyOffer(offer);
+  if (!/^[0-9a-f]{128}$/.test(signature || '')) throw new Error('bad cancellation signature');
+  if (!schnorr.verify(hexToBytes(signature), cancelDigest(offer), hexToBytes(offer.xonly))) throw new Error('cancellation signature is not valid');
+  return true;
+}
 
 // Derive BIP352 outputs to our own silent addresses when one input belongs to the seller.
 export function buyerOutputs(wallet, inputs, recipients) {
@@ -102,12 +119,17 @@ export function buildPurchase({ wallet, utxos, offer, feeRate, network = NETWORK
   verifyOffer(offer, network);
   if (!(feeRate >= 0.1)) throw new Error('fee rate too low');
   if (utxos.some((u) => u.txid === offer.txid && u.vout === offer.vout)) throw new Error('this is your own listing');
-  const spendable = utxos.filter((u) => !u.inscribed && !(u.txid === offer.txid && u.vout === offer.vout)).sort((a, b) => b.value - a.value);
+  const spendable = utxos.filter((u) => !u.inscribed && !(u.txid === offer.txid && u.vout === offer.vout));
   if (spendable.length < 3) throw new Error('NEED_PREPARE');
-  const anchors = spendable.slice(0, 2);
-  const candidates = spendable.slice(2).reverse();
-  const creator = royalty(offer);
-  const kinds = creator ? ['sp', 'sp', 'p2tr', 'p2tr'] : ['sp', 'sp', 'p2tr'];
+  // The two anchor inputs are returned to the buyer and do not fund the sale.
+  // Pick the smallest coins for those slots so the one-time preparation flow
+  // (two 600-sat outputs plus a large change output) can actually buy instead
+  // of trapping the large coin in an anchor and looping on NEED_PREPARE.
+  const ordered = spendable.slice().sort((a, b) => a.value - b.value || a.txid.localeCompare(b.txid) || a.vout - b.vout);
+  const anchors = ordered.slice(0, 2);
+  const candidates = ordered.slice(2).sort((a, b) => b.value - a.value || a.txid.localeCompare(b.txid) || a.vout - b.vout);
+  const creator = 0;
+  const kinds = ['sp', 'sp', 'p2tr'];
   const funding = [];
   let sum = 0, fee, change = 0;
   for (const coin of candidates) {
@@ -132,7 +154,6 @@ export function buildPurchase({ wallet, utxos, offer, feeRate, network = NETWORK
     { script: hexToBytes('5120' + received[1]), value: offer.value },
     { script: payScript(offer.payTo, network), value: sellerProceeds(offer) },
   ];
-  if (creator) outputs.push({ script: hexToBytes(ROYALTY_SCRIPT), value: creator });
   if (change) outputs.push({ script: hexToBytes('5120' + received[2]), value: change });
 
   const tx = new Transaction(TX_OPTIONS);

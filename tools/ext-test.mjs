@@ -61,8 +61,8 @@ try {
   const page = await attach(await newTab('http://127.0.0.1:8364/'));
   await page.waitFor(`!!window.shhhhh`);
   const methods = await page.js(`Object.keys(window.shhhhh).sort()`);
-  const expected = ['buyListing', 'cancelListing', 'connect', 'disconnect', 'inscribe', 'isShhhhh', 'listForSale', 'myItems', 'proveHolding', 'sendBitcoin', 'stake', 'unstake'].sort();
-  ok(JSON.stringify(methods) === JSON.stringify(expected), 'all 11 site APIs injected on an allowed origin');
+  const expected = ['buyListing', 'cancelListing', 'connect', 'disconnect', 'fairCommit', 'fairReveal', 'inscribe', 'isShhhhh', 'listForSale', 'myItems', 'proveHolding', 'sendBitcoin', 'stake', 'unstake'].sort();
+  ok(JSON.stringify(methods) === JSON.stringify(expected), 'all Fair Batch and legacy site APIs injected on an allowed origin');
   ok((await page.js(`window.shhhhh.disconnect()`)).disconnected === true, 'disconnect returns without opening an approval window');
 
   // the background keeps one approval reservation: a second tab/request cannot replace what the user sees

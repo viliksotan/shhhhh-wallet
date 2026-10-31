@@ -14,6 +14,15 @@
 //   GET  /v1/txstatus/:txid        { found, confirmed, height } for one transaction
 //   GET  /v1/price                 BTC price in USD (cached 60 s)
 //   GET  /v1/brc20/:address        BRC-20 balances (UniSat, cached 5 min)
+//   GET  /v1/fair/status            current Fair Batch Mode phase and policy
+//   POST /v1/fair/commit            signed hidden order commitment
+//   POST /v1/fair/reveal            reveal an order during the reveal window
+//   GET  /v1/fair/result/:epoch     deterministic batch result
+//   GET  /v1/fair/audit/:epoch      public hash-chained batch audit records
+//   GET  /v1/market/listings         signed, non-custodial inscription offers
+//   POST /v1/market/list             add a chain-verified signed offer
+//   POST /v1/market/cancel           remove an offer with the seller's signature
+//   GET  /v1/market/fee-policy       available miner-fee payment methods
 //   WS   /v1/sp                    silent payments scan: client sends {scan, spend, start}; Frigate notifications relayed
 //
 // The scan key passes through in memory only (never logged or stored). No spending key ever reaches this server.
@@ -23,6 +32,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { WebSocketServer } from 'ws';
 import { STATUS_PAGE } from './status-page.mjs';
+import { FairMarketCoordinator } from './fair-market.mjs';
+import { MarketStore, cleanMarketOffer } from './market-store.mjs';
+import { parseMarketAsset, sameMarketAsset } from '../src/market-asset.js';
 
 const PORT = Number(process.env.PORT || 8090);
 const COOKIE = process.env.BITCOIN_COOKIE || '/var/lib/bitcoind/.cookie';
@@ -35,6 +47,29 @@ const okOrigin = (o) => ORIGINS.has(o) || /^chrome-extension:\/\/[a-p]{32}$/.tes
 const MAX_CONTENT = 5 * 1024 * 1024;
 // Inscription content: only types that cannot run code when shown by the wallet (images via <img>, text as text)
 const SAFE_TYPES = /^(image\/(png|jpeg|gif|webp|avif|svg\+xml)|text\/plain|application\/json)\b/i;
+const FAIR_AUDIT_FILE = process.env.FAIR_AUDIT_FILE || '';
+const FAIR_STAKES_FILE = process.env.FAIR_STAKES_FILE || '';
+let fairSupplies = {};
+try { fairSupplies = JSON.parse(process.env.FAIR_MARKET_SUPPLY_JSON || '{}'); } catch { throw new Error('FAIR_MARKET_SUPPLY_JSON must be JSON'); }
+let fairStakes = { checkedAt: 0, modified: 0, data: {} };
+function verifiedFairStake(market, walletKey) {
+  if (!FAIR_STAKES_FILE) return 0;
+  const now = Date.now();
+  if (now - fairStakes.checkedAt > 60_000) {
+    fairStakes.checkedAt = now;
+    try {
+      const stat = fs.statSync(FAIR_STAKES_FILE);
+      if (stat.mtimeMs !== fairStakes.modified) fairStakes = { checkedAt: now, modified: stat.mtimeMs, data: JSON.parse(fs.readFileSync(FAIR_STAKES_FILE, 'utf8')) };
+    } catch { fairStakes = { checkedAt: now, modified: 0, data: {} }; }
+  }
+  return Number((fairStakes.data[market] && fairStakes.data[market][walletKey]) ?? fairStakes.data[walletKey] ?? 0);
+}
+const fairMarket = new FairMarketCoordinator({
+  auditFile: FAIR_AUDIT_FILE,
+  stakeLookup: verifiedFairStake,
+  supplyLookup: (market) => fairSupplies[market] ?? null,
+});
+const marketBook = new MarketStore({ file: process.env.MARKET_BOOK_FILE || '/data/shhhhh-market/book.jsonl' });
 // Blocklist: one inscription id per line in /etc/shhhhh-bridge/blocked.txt (re-read every minute)
 const BLOCKED_FILE = process.env.BLOCKED_FILE || '/etc/shhhhh-bridge/blocked.txt';
 let blocked = new Set();
@@ -109,7 +144,8 @@ function send(res, code, body, headers = {}) {
 async function readJSON(req, limit = 2_000_000) {
   let n = 0; const chunks = [];
   for await (const c of req) { n += c.length; if (n > limit) throw Object.assign(new Error('request too large'), { code: 413 }); chunks.push(c); }
-  return JSON.parse(Buffer.concat(chunks).toString() || '{}');
+  try { return JSON.parse(Buffer.concat(chunks).toString() || '{}'); }
+  catch { throw Object.assign(new Error('request body must be valid JSON'), { status: 400 }); }
 }
 
 // ---------------------------------------------------------------- public health numbers (no keys, nothing about users)
@@ -125,6 +161,71 @@ function frigateInfo() {
 async function ordInfo() {
   try { const r = await fetch(`${ORD}/status`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(3000) }); return r.ok ? await r.json() : null; } catch { return null; }
 }
+async function marketChainCheck(offer) {
+  const outpoint = `${offer.txid}:${offer.vout}`;
+  const coin = await rpc('gettxout', [offer.txid, offer.vout, true]);
+  if (!coin) throw Object.assign(new Error('the inscription output is already spent'), { status: 409 });
+  if (!(coin.confirmations > 0)) throw Object.assign(new Error('the inscription output must be confirmed'), { status: 409 });
+  if (Math.round(coin.value * 1e8) !== offer.value || coin.scriptPubKey?.hex !== '5120' + offer.xonly)
+    throw Object.assign(new Error('the offer does not match the Bitcoin output'), { status: 409 });
+  const response = await fetch(`${ORD}/output/${outpoint}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+  if (!response.ok) throw Object.assign(new Error(response.status === 404 ? 'the inscription output was not found' : 'the inscription index is unavailable'), { status: response.status === 404 ? 409 : 503 });
+  const ord = await response.json();
+  const inscriptions = Array.isArray(ord.inscriptions) ? ord.inscriptions : [];
+  if (inscriptions.length !== 1 || inscriptions[0] !== offer.inscriptionId)
+    throw Object.assign(new Error('the output must hold exactly the listed inscription'), { status: 409 });
+  const runes = ord.runes;
+  if ((Array.isArray(runes) && runes.length) || (runes && typeof runes === 'object' && Object.keys(runes).length))
+    throw Object.assign(new Error('outputs containing runes cannot be listed'), { status: 409 });
+
+  if (blocked.has(offer.inscriptionId)) throw Object.assign(new Error('this inscription is blocked on this node'), { status: 451 });
+  const content = await fetch(`${ORD}/content/${offer.inscriptionId}`, { signal: AbortSignal.timeout(20000) });
+  if (!content.ok) throw Object.assign(new Error('the inscription content is unavailable'), { status: 503 });
+  const type = content.headers.get('content-type') || '';
+  let asset = { kind: 'ordinal' };
+  if (/^(text\/plain|application\/json)\b/i.test(type)) {
+    const declared = Number(content.headers.get('content-length') || 0);
+    if (declared && declared > 16_384) { try { content.body?.cancel(); } catch {} }
+    else {
+      const body = new Uint8Array(await content.arrayBuffer());
+      if (body.length <= 16_384) asset = parseMarketAsset(body);
+    }
+  } else { try { content.body?.cancel(); } catch {} }
+
+  // JSON shape alone is not enough: a forged transfer document has no BRC-20
+  // balance. UniSat's indexer must recognize the exact transfer and current
+  // outpoint before it can enter a 4/5/6-byte ticker category.
+  if (asset.kind === 'brc20') {
+    if (!UNISAT_KEY) throw Object.assign(new Error('the BRC-20 indexer is not configured'), { status: 503 });
+    const indexed = await unisatFetch(`https://open-api.unisat.io/v1/indexer/inscription/info/${offer.inscriptionId}`);
+    const brc20 = indexed.data?.brc20;
+    const verified = parseMarketAsset(JSON.stringify({ p: 'brc-20', op: brc20?.op, tick: brc20?.tick, amt: brc20?.amt }));
+    if (verified.kind !== 'brc20' || !sameMarketAsset(asset, verified))
+      throw Object.assign(new Error('the indexer does not recognize this BRC-20 transfer'), { status: 409 });
+    const indexedUtxo = indexed.data?.utxo;
+    const indexedVout = indexedUtxo?.vout ?? indexedUtxo?.idx;
+    if (!indexedUtxo || indexedUtxo.txid !== offer.txid || Number(indexedVout) !== offer.vout)
+      throw Object.assign(new Error('the BRC-20 transfer is no longer at the listed output'), { status: 409 });
+  }
+  return asset;
+}
+let marketSweepCursor = '0', marketSweepRunning = false;
+async function sweepMarketBook() {
+  if (marketSweepRunning) return;
+  marketSweepRunning = true;
+  try {
+    const page = marketBook.list({ cursor: marketSweepCursor, limit: 25 });
+    for (const listing of page.listings) {
+      const offer = listing.offer;
+      const coin = await rpc('gettxout', [offer.txid, offer.vout, true]);
+      if (!coin || Math.round(coin.value * 1e8) !== offer.value || coin.scriptPubKey?.hex !== '5120' + offer.xonly) marketBook.expire(listing.id);
+    }
+    marketSweepCursor = page.nextCursor || '0';
+  } catch (error) { console.error(new Date().toISOString(), '/v1/market/sweep', error.message); }
+  finally { marketSweepRunning = false; }
+}
+setTimeout(sweepMarketBook, 5000).unref();
+setInterval(sweepMarketBook, 30000).unref();
 function disk(path) { try { const f = fs.statfsSync(path); return { total: f.blocks * f.bsize, free: f.bavail * f.bsize }; } catch { return null; } }
 async function nodeStatus() {
   const [chain, net_, mem, fr, ord] = await Promise.all([rpc('getblockchaininfo'), rpc('getnetworkinfo'), rpc('getmempoolinfo'), frigateInfo(), ordInfo()]);
@@ -135,6 +236,7 @@ async function nodeStatus() {
                lastBlockTime: best.time * 1000, sizeGB: Math.round(chain.size_on_disk / 1e9), mempoolTxs: mem.size, mempoolMB: Math.round(mem.bytes / 1e6) },
     frigate: fr ? { ok: fr.health && fr.health.indexHeight >= chain.blocks - 1, height: fr.health && fr.health.indexHeight, version: fr.version, uptime: fr.uptimeSeconds } : { ok: false },
     ord: ord ? { ok: ord.height >= chain.blocks - 2, height: ord.height, inscriptions: ord.inscriptions } : { ok: false },
+    market: { ok: true, activeListings: marketBook.list({ limit: 1 }).total, brc20Indexer: !!UNISAT_KEY },
     machine: { load: os.loadavg().map((x) => Math.round(x * 100) / 100), cpus: os.cpus().length, memTotal: os.totalmem(), memFree: os.freemem(),
                uptime: os.uptime(), disks: { system: disk('/'), data: disk('/data') } },
   };
@@ -147,6 +249,7 @@ setInterval(() => { if (traffic.size) { console.log('traffic/min', JSON.stringif
 const countHit = (k) => traffic.set(k, (traffic.get(k) || 0) + 1);
 async function route(req, res, url, ip) {
   const p = url.pathname;
+  let m;
   countHit(p.split('/').slice(0, 3).join('/'));
   if (p === '/health') {
     const height = await cached('tip', 10000, () => rpc('getblockcount'));
@@ -156,6 +259,55 @@ async function route(req, res, url, ip) {
     'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:" });
   if (p === '/v1/status') return send(res, 200, await cached('status', 5000, nodeStatus), { 'Cache-Control': 'no-cache' });
   if (!allow(ip, 1)) { countHit('429'); return send(res, 429, { error: 'too many requests, slow down' }); }
+
+  if (req.method === 'GET' && p === '/v1/fair/status') {
+    return send(res, 200, fairMarket.status(url.searchParams.get('market') || 'shhhhh/btc'));
+  }
+  if (req.method === 'POST' && p === '/v1/fair/commit') {
+    if (!allow('fair:' + ip, 10, 120)) return send(res, 429, { error: 'too many fair-market commitments' });
+    return send(res, 200, fairMarket.commit(await readJSON(req, 20_000)));
+  }
+  if (req.method === 'POST' && p === '/v1/fair/reveal') {
+    if (!allow('fair:' + ip, 10, 120)) return send(res, 429, { error: 'too many fair-market reveals' });
+    return send(res, 200, fairMarket.reveal(await readJSON(req, 20_000)));
+  }
+  if (req.method === 'GET' && (m = p.match(/^\/v1\/fair\/(result|audit)\/(\d{1,8})$/))) {
+    const market = url.searchParams.get('market') || 'shhhhh/btc';
+    return send(res, 200, m[1] === 'result' ? fairMarket.result(Number(m[2]), market) : fairMarket.audit(Number(m[2]), market));
+  }
+
+  if (req.method === 'GET' && p === '/v1/market/listings') {
+    const query = { cursor: url.searchParams.get('cursor') || 0, limit: url.searchParams.get('limit') || 50 };
+    return send(res, 200, marketBook.list(query), { 'Cache-Control': 'no-cache' });
+  }
+  if (req.method === 'POST' && p === '/v1/market/list') {
+    if (!allow('market-write:' + ip, 5, 60)) return send(res, 429, { error: 'too many market updates' });
+    const { offer } = await readJSON(req, 20_000);
+    const clean = cleanMarketOffer(offer);
+    // The signature is checked by MarketStore. Chain/ord checks stop stale or
+    // misleading listings entering the public book; buyers check again.
+    const asset = await marketChainCheck(clean);
+    return send(res, 200, marketBook.put(clean, Date.now(), asset));
+  }
+  if (req.method === 'POST' && p === '/v1/market/cancel') {
+    if (!allow('market-write:' + ip, 3, 60)) return send(res, 429, { error: 'too many market updates' });
+    return send(res, 200, marketBook.cancel(await readJSON(req, 20_000)));
+  }
+  if (req.method === 'GET' && p === '/v1/market/fee-policy') {
+    return send(res, 200, {
+      v: 1,
+      network: 'bitcoin-mainnet',
+      minerAsset: 'BTC',
+      silentFallback: false,
+      btc: { enabled: true, payer: 'buyer' },
+      shhhhh: {
+        enabled: false,
+        ticker: 'shhhhh',
+        payer: 'sponsor',
+        reason: 'The independent shhhhh fee Sponsor is not online yet. Choose BTC; the wallet will never switch automatically.',
+      },
+    }, { 'Cache-Control': 'public, max-age=30' });
+  }
 
   if (req.method === 'GET' && p === '/v1/tip') return send(res, 200, { height: await cached('tip', 10000, () => rpc('getblockcount')) });
 
@@ -182,7 +334,6 @@ async function route(req, res, url, ip) {
     }), { 'Cache-Control': 'public, max-age=30' });
   }
 
-  let m;
   if (req.method === 'GET' && (m = p.match(/^\/v1\/tx\/([0-9a-f]{64})$/))) {
     const hex = await cached('tx:' + m[1], 3600000, () => rpc('getrawtransaction', [m[1], 0]));
     return send(res, 200, hex, { 'Cache-Control': 'public, max-age=3600' });
@@ -293,10 +444,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try { await route(req, res, url, ip); }
   catch (e) {
-    const code = e.code === 413 ? 413 : e.rpc ? 400 : 502;
-    if (!res.headersSent) send(res, code, { error: e.rpc ? e.rpc.message : code === 413 ? e.message : 'server busy, try again' });
+    const code = e.status || (e.code === 413 ? 413 : e.rpc ? 400 : 502);
+    if (!res.headersSent) send(res, code, { error: e.rpc ? e.rpc.message : (e.status || code === 413) ? e.message : 'server busy, try again' });
     // endpoint only (e.g. /v1/brc20): never the address, txid or inscription being asked about
-    if (!e.rpc) console.error(new Date().toISOString(), url.pathname.split('/').slice(0, 3).join('/'), e.message.replace(/bc1[0-9a-z]{20,}/gi, 'ADDR'));
+    if (!e.rpc && !e.status) console.error(new Date().toISOString(), url.pathname.split('/').slice(0, 3).join('/'), e.message.replace(/bc1[0-9a-z]{20,}/gi, 'ADDR'));
   }
 });
 

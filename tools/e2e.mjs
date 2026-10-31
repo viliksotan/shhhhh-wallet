@@ -44,16 +44,30 @@ try {
   await send('Page.navigate', { url: 'http://127.0.0.1:8362/' });
   await waitFor(`!!document.querySelector('.gate h2')`);
   await shot('1-welcome');
+  ok(await js(`document.querySelector('.gate h2').textContent === 'A silent Bitcoin wallet' && localStorage.getItem('shhhhh.language') === null`), 'first launch defaults to English without a stored preference');
+  await click('Language'); await sleep(200);
+  await js(`[...document.querySelectorAll('.language-list .srow')].find(b => /日本語/.test(b.textContent)).click()`); await sleep(200);
+  ok(await js(`/サイレント/.test(document.querySelector('.gate h2').textContent) && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '言語')`), 'language can be changed before creating a wallet');
+  await click('言語'); await sleep(200);
+  await js(`[...document.querySelectorAll('.language-list .srow')].find(b => b.querySelector('b').textContent === 'English').click()`); await sleep(200);
+  ok(await js(`document.querySelector('.gate h2').textContent === 'A silent Bitcoin wallet'`), 'English can be restored before creating a wallet');
 
   // restore: switched on ONLY on the owner's local copy (this test runs there); the extension/beta keep "soon"
   await tap('Restore with 12 words'); await sleep(300);
   ok(await js(`!!document.querySelector('#phrase')`), 'local copy: restore screen opens');
-  await click('Back'); await sleep(300);
+  await js(`document.querySelector('[aria-label=Back]').click()`); await sleep(300);
   // create a wallet (also the flow every beta tester uses)
   await click('Create a new wallet');
   const firstWords = await js(`[...document.querySelectorAll('.words li')].map(li => li.textContent)`);
   await js(`document.getElementById('saved').checked = true`); await click('Continue');
-  await type('#pw1', 'test-password-1'); await type('#pw2', 'test-password-1');
+  ok(await js(`document.querySelectorAll('.password-field').length === 2 && getComputedStyle(document.querySelector('#pw1')).borderTopWidth === '2px' && getComputedStyle(document.querySelector('#pw1')).backgroundColor !== getComputedStyle(document.body).backgroundColor`), 'create-wallet password fields are visibly separated from the wallet background');
+  await type('#pw1', 'test-password-1');
+  await js(`document.querySelector('[aria-controls=pw1]').click()`); await sleep(100);
+  ok(await js(`document.querySelector('#pw1').type === 'text' && document.querySelector('#pw2').type === 'password' && document.querySelector('[aria-controls=pw1]').getAttribute('aria-label') === 'Hide password'`), 'password visibility can be toggled per field');
+  await js(`document.querySelector('[aria-controls=pw1]').click()`); await sleep(100);
+  ok(await js(`document.querySelector('#pw1').type === 'password'`), 'password can be hidden again');
+  await sleep(2300); await shot('2a-password');
+  await type('#pw2', 'test-password-1');
   await click('Create wallet');
   await waitFor(`!!document.getElementById('sync')`, 30000);
   ok(/Bitcoin/.test(await js(`document.querySelector('.asset').textContent`)), 'BTC is listed first');
@@ -75,6 +89,53 @@ try {
   await shot('3-home');
   const LS = await js(`JSON.stringify(localStorage)`);
   ok(!LS.includes(firstWords.slice(0, 3).join(' ')), 'recovery phrase not readable in storage');
+  ok(await js(`[...document.querySelectorAll('.tab')].some(b => b.textContent.trim() === 'Market')`), 'wallet navigation includes the built-in market');
+  await tap('Market'); await waitFor(`!!document.querySelector('.market-token-section.demo')`);
+  await waitFor(`document.querySelector('[data-market-length="all"] small')?.textContent.trim() === '0' && !document.querySelector('.market-service-banner')`);
+  ok(true, 'development market API is online instead of silently accepting a 404 backend');
+  ok(await js(`document.querySelectorAll('.tab').length === 5 && document.querySelector('.tabs').scrollWidth <= document.querySelector('.tabs').clientWidth + 1`), 'five wallet tabs fit at mobile width');
+  ok(await js(`getComputedStyle(document.querySelector('.market-head')).display === 'grid' && getComputedStyle(document.querySelector('.market-filter')).gridTemplateColumns.split(' ').length === 2`), 'market header and two-way filter use the responsive layout');
+  ok(await js(`document.querySelectorAll('.market-length-filter button').length === 4 && document.querySelector('.market-controls').scrollWidth <= document.querySelector('.market-controls').clientWidth + 1`), 'all/4/5/6-byte filters fit the mobile market');
+  ok(await js(`/Seller keeps custody/.test(document.querySelector('.market-security-line').textContent) && /miners receive BTC/i.test(document.querySelector('.market-security-line').textContent)`), 'market explains atomic custody and real miner-fee settlement');
+  ok((await js(`document.querySelectorAll('.market-token-row[data-demo="true"]').length`)) === 12 && await js(`[4,5,6].every(n => document.querySelectorAll('.market-token-row[data-demo="true"][data-ticker-bytes="'+n+'"]').length === 4)`) && await js(`/not on-chain/i.test(document.querySelector('.market-token-section.demo').textContent)`), 'market shows four demo tickers for each namespace in a compact market list');
+  for (const bytes of [4, 5, 6]) {
+    await js(`document.querySelector('[data-market-length="${bytes}"]').click()`); await sleep(120);
+    ok((await js(`document.querySelectorAll('.market-token-row[data-demo="true"]').length`)) === 4 && await js(`[...document.querySelectorAll('.market-token-row[data-demo="true"]')].every(row => row.dataset.tickerBytes === '${bytes}')`), `${bytes}-byte filter applies to the demo market list`);
+  }
+  await js(`document.querySelector('[data-market-length="all"]').click()`); await sleep(120);
+  ok((await js(`document.querySelectorAll('.market-token-row[data-demo="true"]').length`)) === 12, 'all-length filter restores all twelve demo tickers');
+  await shot('3a-market');
+  await js(`document.querySelector('.market-token-row[data-demo="true"][data-market-ticker="ordi"]').click()`); await waitFor(`!!document.querySelector('.market-detail-head')`);
+  ok(await js(`document.querySelector('.market-detail-title b').textContent === 'ordi' && document.querySelectorAll('.market-stat-grid .market-stat').length === 6 && document.querySelectorAll('.market-order-card.demo').length === 3`), 'ticker detail shows six honest statistics and three demo orders');
+  await shot('3a-market-detail');
+  await js(`document.querySelector('.market-order-card.demo button').click()`); await waitFor(`!!document.querySelector('.market-demo-steps')`);
+  ok((await js(`document.querySelectorAll('.market-demo-steps > div').length`)) === 4 && await js(`/Demo only/.test(document.querySelector('.sheet').textContent) && !document.querySelector('.sheet input[type="password"]') && !/Sign & list|Confirm & buy/.test(document.querySelector('.sheet').textContent)`), 'demo order previews the four-step flow without requesting a signature');
+  await click('Got it'); await sleep(250);
+  await js(`document.querySelector('[aria-label="Back to markets"]').click()`); await waitFor(`document.querySelectorAll('.market-token-row[data-demo="true"]').length === 12`);
+  ok(!await js(`!!document.querySelector('.market-detail-head')`), 'back returns from ticker detail to the market list');
+  await tap('Home'); await sleep(250);
+
+  // inscription center: OKX-inspired information flow, backed by the wallet's own commit/reveal builder
+  await tap('Inscriptions'); await waitFor(`!!document.querySelector('.insc-summary')`);
+  ok(/Bitcoin/.test(await js(`document.querySelector('.insc-summary').textContent`)), 'inscription center shows the Bitcoin network summary');
+  ok((await js(`document.querySelectorAll('.insc-kinds > button').length`)) === 4, 'inscription center offers BRC-20, BRC2.0, text and image flows');
+  await shot('3b-inscriptions');
+  await js(`[...document.querySelectorAll('.insc-kinds > button')].find(b => /BRC-20/.test(b.textContent)).click()`);
+  await waitFor(`!!document.querySelector('.insc-compose .empty')`);
+  ok(await js(`/transfer/i.test(document.querySelector('.insc-compose').textContent) && !/Mint an existing|Number of mints/.test(document.querySelector('.insc-compose').textContent) && !document.querySelector('.ticker-byte-pick')`), 'BRC-20 keeps transfers available while mint controls are hidden');
+  await js(`document.querySelector('.sheet-x').click()`); await sleep(250);
+  await js(`[...document.querySelectorAll('.insc-kinds > button')].find(b => /BRC2\.0/.test(b.textContent)).click()`);
+  await waitFor(`!!document.querySelector('.insc-compose')`);
+  ok(await js(`/Call an existing BRC2\.0/.test(document.querySelector('.insc-compose').textContent) && !/Deploy contract|Deployment data/.test(document.querySelector('.insc-compose').textContent) && /BRC20PROG/.test(document.querySelector('.insc-compose').textContent)`), 'BRC2.0 keeps contract calls available while deployment controls are hidden');
+  await js(`document.querySelector('.sheet-x').click()`); await sleep(250);
+  await js(`[...document.querySelectorAll('.insc-kinds > button')].find(b => /Text/.test(b.textContent)).click()`);
+  await waitFor(`!!document.querySelector('.sheet textarea')`);
+  await type('.sheet textarea', 'hello from shhhhh');
+  await js(`[...document.querySelectorAll('.sheet button')].find(b => b.textContent.trim() === 'Next').click()`);
+  await waitFor(`!document.querySelector('.sheet .err').hidden`, 10000);
+  ok(/no BTC|not enough/i.test(await js(`document.querySelector('.sheet .err').textContent`)), 'text inscription preview uses the real transaction builder');
+  await js(`document.querySelector('.sheet-x').click()`); await sleep(300);
+  await tap('Home'); await sleep(300);
 
   // send: the sheet opens, Review responds; the empty test wallet must show an error IN the sheet (no popups)
   await tap('Send'); await waitFor(`!!document.querySelector('.sheet-bg.open #to')`);
@@ -96,6 +157,17 @@ try {
   await js(`document.querySelectorAll('.sheet-bg').forEach(b => b.remove())`); await sleep(300);
   // wallet name: rename shows in the header (avatar letter too), long names cut with "…", default comes back
   await js(`[...document.querySelectorAll('.tab')].find(b => /Settings/.test(b.textContent)).click()`); await sleep(300);
+  await js(`[...document.querySelectorAll('button')].find(b => /Language/.test(b.textContent)).click()`); await sleep(250);
+  ok((await js(`document.querySelectorAll('.language-list .srow').length`)) === 19, 'language picker lists all 19 supported languages');
+  await js(`[...document.querySelectorAll('.language-list .srow')].find(b => /日本語/.test(b.textContent)).click()`); await sleep(250);
+  ok(await js(`[...document.querySelectorAll('.tab')].some(b => /インスクリプション/.test(b.textContent))`), 'language switch updates the active wallet interface to Japanese');
+  await js(`document.querySelectorAll('.tab')[2].click()`); await waitFor(`!!document.querySelector('.market-token-section.demo')`); await sleep(200);
+  ok(await js(`document.querySelector('.market-head h2').textContent === 'マーケット' && document.querySelector('.market-security-line b').textContent !== 'Non-custodial settlement' && document.querySelector('.market-token-section.demo .market-section-head b').textContent === 'デモマーケット' && document.querySelector('[data-market-length="4"] span').textContent === '4バイト'`), 'market list, ticker filters and demo guidance are localized after switching language');
+  await sleep(2300); await shot('3c-market-ja');
+  await js(`document.querySelectorAll('.tab')[4].click()`); await sleep(200);
+  await js(`[...document.querySelectorAll('button')].find(b => /言語/.test(b.textContent)).click()`); await sleep(250);
+  await js(`[...document.querySelectorAll('.language-list .srow')].find(b => b.querySelector('b').textContent === 'English').click()`); await sleep(250);
+  ok(await js(`localStorage.getItem('shhhhh.language') === null && [...document.querySelectorAll('.tab')].some(b => /Inscriptions/.test(b.textContent))`), 'English is restored as the storage-free default');
   await js(`[...document.querySelectorAll('button')].find(b => /Wallet name/.test(b.textContent)).click()`); await sleep(300);
   await type('#wname', 'Bear vault <b>x</b> 🐻');
   await js(`[...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Save').click()`); await sleep(400);

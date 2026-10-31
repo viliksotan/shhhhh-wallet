@@ -2,17 +2,20 @@
 import qrcode from 'qrcode-generator';
 import * as K from './keys.js';
 import { bytesToHex, hexToBytes, outputPrivKey, decodeAddress, tagged, signMsg } from './sp.js';
-import { NODE, TAPROOT_START, MIN_START, getTip, getFees, syncWallet, spendable, broadcast, contentUrl, liveWatch, getDeposit, getTxStatus, getTxHex, getOutspends, getOutputInscriptions } from './node.js';
+import { NODE, TAPROOT_START, MIN_START, getTip, getFees, syncWallet, spendable, broadcast, contentUrl, liveWatch, getDeposit, getTxStatus, getTxHex, getOutspends, getOutputInscriptions, getMarketListings, listMarketOffer, cancelMarketListing, getMarketFeePolicy } from './node.js';
 
 // shhhhh wallet launched after this block: wallets made here cannot have older payments, so restores start here by default
 const SHHHHH_START = MIN_START;
 import { buildSend, buildSendInscription, vsizeOf, DUST } from './send.js';
-import { buildInscribeTransfer, buildInscribe, MAX_INSCRIPTION_BYTES } from './inscribe.js';
+import { BRC20_CT, brc20Mint, brc20TickerBytes, normalizeBrc20Tick, brc2Call, brc2Deploy, buildBrc2Inscribe, buildInscribeTransfer, buildInscribe, MAX_INSCRIPTION_BYTES } from './inscribe.js';
 import { stakeTarget, buildUnstake, MIN_STAKE, BLOCKS_PER_DAY } from './stake.js';
-import { createOffer, verifyOffer, cancelOffer, buildPurchase, MIN_PRICE, MAX_PRICE, ROYALTY_BPS, PREPARE_COIN_VALUE } from './market.js';
+import { createOffer, verifyOffer, cancelOffer, buildPurchase, MIN_PRICE, MAX_PRICE, PREPARE_COIN_VALUE } from './market.js';
+import { cleanMarketAsset, marketAssetCategory, parseMarketAsset, sameMarketAsset } from './market-asset.js';
+import { FAIR_VERSION, fairCommitment, fairCommitMessage, fairEpoch, normalizeFairOrder } from './fair-market.js';
 import { kv } from './db.js';
 import { taprootAddress } from './scan.js';
 import { Address, NETWORK, Transaction } from '@scure/btc-signer';
+import { DEFAULT_LANGUAGE, LANGUAGES, normalizeLanguage, translate } from './i18n.js';
 const LS_NAME = 'shhhhh.name';                                   // wallet name shown in the header (this browser only)
 const walletName = () => (store.get(LS_NAME) || '').trim() || 'Silent wallet';
 const LS_VAULT = 'shhhhh.vault', LS_STATE = 'shhhhh.state', LS_PARTIAL = 'shhhhh.scan';  // scan progress of an unfinished first sync
@@ -23,6 +26,10 @@ const store = {
   set(k, v) { localStorage.setItem(k, JSON.stringify(v)); },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
+const LS_LANG = 'shhhhh.language';
+const language = () => normalizeLanguage(store.get(LS_LANG));
+const tr = (value) => translate(value, language());
+const setLanguage = (code) => { if (code === DEFAULT_LANGUAGE) store.del(LS_LANG); else store.set(LS_LANG, normalizeLanguage(code)); };
 const fmt = (n) => Number(n || 0).toLocaleString('en-US');
 const short = (s, a = 10, b = 8) => (s && s.length > a + b + 1 ? s.slice(0, a) + '…' + s.slice(-b) : s);
 
@@ -35,11 +42,17 @@ function h(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === 'class') e.className = v; else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
-    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : (['placeholder', 'title', 'aria-label'].includes(k) ? tr(String(v)) : v));
   }
-  for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : document.createTextNode(tr(String(c))));
   return e;
 }
+function flowTop(title, back) {
+  return h('div', { class: 'flow-top' },
+    h('button', { class: 'flow-back', 'aria-label': 'Back', onclick: back }, icon('back', 21)),
+    h('b', {}, title), h('span', { class: 'flow-top-space' }));
+}
+function actionBar(...buttons) { return h('div', { class: 'flow-actions' }, ...buttons); }
 function screen(...kids) { app.replaceChildren(h('div', { class: 'screen' }, ...kids)); window.scrollTo(0, 0); }
 const FRIENDLY = [
   [/no spendable BTC/i, 'You have no BTC to send yet.'],
@@ -50,7 +63,7 @@ const FRIENDLY = [
   [/wrong password/i, 'Wrong password.'],
   [/enter an amount/i, 'Enter an amount.'],
 ];
-function friendly(m) { for (const [re, t] of FRIENDLY) if (re.test(m)) return t; return m.charAt(0).toUpperCase() + m.slice(1); }
+function friendly(m) { for (const [re, t] of FRIENDLY) if (re.test(m)) return tr(t); return tr(m.charAt(0).toUpperCase() + m.slice(1)); }
 function err(box, e) { box.textContent = friendly(e && e.message ? e.message : String(e)); box.hidden = false; }
 const logo = () => h('div', { class: 'brand' }, h('img', { src: 'logo.png', alt: '' }), h('span', {}, 'shhhhh ', h('b', {}, 'wallet')));
 
@@ -73,7 +86,19 @@ function start() {
      // restore is paused for the beta (full scans are heavy on the node): the screen stays in the code for later
      LOCAL_ONLY
        ? h('button', { class: 'textbtn', onclick: () => restoreScreen() }, 'Restore with 12 words')        // owner's local copy only
-       : h('button', { class: 'textbtn', onclick: () => toast('Restoring a wallet is coming soon') }, 'Restore with 12 words · soon')]);
+        : h('button', { class: 'textbtn', onclick: () => toast('Restoring a wallet is coming soon') }, 'Restore with 12 words · soon'),
+      h('button', { class: 'textbtn', onclick: () => languageScreen(start) }, 'Language')]);
+}
+
+function languageScreen(back) {
+  const current = language();
+  screen(flowTop('Language', back), h('p', { class: 'fine center' }, 'Choose display language. English is used by default.'),
+    h('div', { class: 'slist language-list' }, LANGUAGES.map((option) =>
+      h('button', { class: 'srow opt' + (option.code === current ? ' sel' : ''), 'aria-pressed': option.code === current, onclick: () => {
+        setLanguage(option.code); toast('Language changed'); setTimeout(back, 120);
+      } },
+        h('span', { class: 'srow-t' }, h('b', {}, option.native), h('small', {}, option.english)),
+        option.code === current ? h('span', { class: 'opt-ck' }, icon('check', 18)) : null))));
 }
 
 // ---------------------------------------------------------------- backup import (moves a wallet between the web page and the extension)
@@ -84,12 +109,12 @@ function importScreen() {
   const e = h('div', { class: 'err', hidden: true });
   const area = h('textarea', { id: 'bk', rows: 4, autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste the backup text, or choose the file below' });
   const file = h('input', { type: 'file', accept: '.json,application/json', onchange: async () => { const f = file.files[0]; if (f) area.value = await f.text(); } });
-  screen(logo(), h('h2', {}, 'Import a backup'),
+  screen(flowTop('Import a backup', start),
     h('p', { class: 'fine' }, 'From Settings → Back up. Needs its password.'),
     h('label', { class: 'field' }, 'Backup', area), file,
     h('label', { class: 'field' }, 'Password of that wallet', h('input', { id: 'bkpw', type: 'password', autocomplete: 'current-password' })),
     e,
-    h('button', { class: 'main', id: 'go', onclick: async () => {
+    actionBar(h('button', { class: 'main', id: 'go', onclick: async () => {
       e.hidden = true;
       let b; try { b = JSON.parse($('bk').value); } catch { return err(e, 'That is not a shhhhh wallet backup.'); }
       if (!b || b.format !== BACKUP_FORMAT || !b.vault) return err(e, 'That is not a shhhhh wallet backup.');
@@ -102,38 +127,35 @@ function importScreen() {
         await openSession(secret);
         toast('Wallet imported ✓');
       } catch (x) { err(e, x); $('go').disabled = false; $('go').textContent = 'Import'; }
-    } }, 'Import'),
-    h('button', { class: 'ghost', onclick: start }, 'Back'));
+    } }, 'Import')));
 }
 
 // ---------------------------------------------------------------- create
-function createScreen() {
-  const words = K.newMnemonic(12).split(' ');
-  screen(logo(), h('h2', {}, 'Your recovery phrase'),
+function createScreen(existingWords = null) {
+  const words = existingWords || K.newMnemonic(12).split(' ');
+  screen(flowTop('Your recovery phrase', start),
     h('p', { class: 'warn' }, 'Write these 12 words on paper, in order. Never share them.'),
     h('ol', { class: 'words' }, words.map((w) => h('li', {}, w))),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'saved' }), ' I wrote down the 12 words'),
-    h('button', { class: 'main', onclick: () => { if (!$('saved').checked) return toast('Tick the box once you wrote the words down'); passwordScreen(words.join(' '), null); } }, 'Continue'),
-    h('button', { class: 'ghost', onclick: start }, 'Back'));
+    actionBar(h('button', { class: 'main', onclick: () => { if (!$('saved').checked) return toast('Tick the box once you wrote the words down'); passwordScreen(words.join(' '), null); } }, 'Continue')));
 }
 function confirmScreen(words) {
   const picks = [...crypto.getRandomValues(new Uint8Array(3))].map((b, i) => ((b % 4) + i * 4)).sort((a, b) => a - b);
   const e = h('div', { class: 'err', hidden: true });
-  screen(logo(), h('h2', {}, 'Check your phrase'), h('p', {}, 'Type these words from your paper:'),
+  screen(flowTop('Check your phrase', () => createScreen(words)), h('p', {}, 'Type these words from your paper:'),
     picks.map((i) => h('label', { class: 'field' }, `Word #${i + 1}`, h('input', { id: 'w' + i, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' }))),
     e,
-    h('button', { class: 'main', onclick: () => {
+    actionBar(h('button', { class: 'main', onclick: () => {
       const bad = picks.filter((i) => $('w' + i).value.trim().toLowerCase() !== words[i]);
       if (bad.length) return err(e, `Word #${bad[0] + 1} does not match. Check your paper.`);
       passwordScreen(words.join(' '), null);
-    } }, 'Confirm'),
-    h('button', { class: 'ghost', onclick: () => createScreen() }, 'Start over'));
+    } }, 'Confirm')));
 }
 
 // ---------------------------------------------------------------- restore
 function restoreScreen() {
   const e = h('div', { class: 'err', hidden: true });
-  screen(logo(), h('h2', {}, 'Restore a wallet'),
+  screen(flowTop('Restore a wallet', start),
     h('label', { class: 'field' }, 'Recovery phrase (12 or 24 words)', h('textarea', { id: 'phrase', rows: 3, autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false' })),
     h('div', { class: 'field' }, 'Where does this wallet come from?',
       h('label', { class: 'check' }, h('input', { type: 'radio', name: 'src', value: 'shhhhh', checked: true }), ' Created in shhhhh wallet (fast: a few seconds)'),
@@ -141,26 +163,44 @@ function restoreScreen() {
       h('label', { class: 'check' }, h('input', { type: 'radio', name: 'src', value: 'block' }), ' I know the block to start from:'),
       h('input', { id: 'bday', inputmode: 'numeric', placeholder: 'e.g. 968871', onfocus: () => { document.querySelector('input[name=src][value=block]').checked = true; } })),
     e,
-    h('button', { class: 'main', onclick: () => {
+    actionBar(h('button', { class: 'main', onclick: () => {
       const p = $('phrase').value;
       if (!K.isValidMnemonic(p)) return err(e, 'That phrase is not valid. Check the words and their order.');
       const src = document.querySelector('input[name=src]:checked').value;
       let b = src === 'full' ? TAPROOT_START : SHHHHH_START;
       if (src === 'block') { b = parseInt($('bday').value, 10); if (!Number.isFinite(b) || b < 0) return err(e, 'Enter a block number, e.g. 968871.'); }
       passwordScreen(K.normalizeMnemonic(p), b);
-    } }, 'Continue'),
-    h('button', { class: 'ghost', onclick: start }, 'Back'));
+    } }, 'Continue')));
 }
 
 // ---------------------------------------------------------------- password
+function passwordEntry(id, label) {
+  const input = h('input', { id, type: 'password', autocomplete: 'new-password', spellcheck: 'false', autocapitalize: 'none' });
+  const toggle = h('button', {
+    type: 'button', class: 'password-toggle', 'aria-label': 'Show password', 'aria-controls': id, 'aria-pressed': 'false', title: 'Show password',
+    onclick: () => {
+      const showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      toggle.setAttribute('aria-label', showing ? tr('Show password') : tr('Hide password'));
+      toggle.setAttribute('title', showing ? tr('Show password') : tr('Hide password'));
+      toggle.setAttribute('aria-pressed', String(!showing));
+      toggle.replaceChildren(icon(showing ? 'eye' : 'eyeoff', 21));
+      input.focus();
+    },
+  }, icon('eye', 21));
+  return h('div', { class: 'field password-field' }, h('label', { class: 'password-label', for: id }, label), h('div', { class: 'password-wrap' }, input, toggle));
+}
+
 function passwordScreen(mnemonic, birthday) {
   const e = h('div', { class: 'err', hidden: true });
-  screen(logo(), h('h2', {}, 'Set a password'),
+  const back = birthday === null ? () => createScreen(mnemonic.split(' ')) : restoreScreen;
+  screen(flowTop('Set a password', back), h('div', { class: 'password-setup' },
+    h('div', { class: 'password-intro' }, icon('lock', 25), h('div', {}, h('b', {}, 'Protect this wallet'), h('p', { class: 'fine' }, 'Use at least 8 characters. You can show each password to check it.'))),
     h('p', { class: 'fine' }, 'Locks the wallet on this device.'),
-    h('label', { class: 'field' }, 'Password (8+ characters)', h('input', { id: 'pw1', type: 'password', autocomplete: 'new-password' })),
-    h('label', { class: 'field' }, 'Repeat password', h('input', { id: 'pw2', type: 'password', autocomplete: 'new-password' })),
+    passwordEntry('pw1', 'Password (8+ characters)'),
+    passwordEntry('pw2', 'Repeat password'),
     e,
-    h('button', { class: 'main', id: 'go', onclick: async () => {
+    actionBar(h('button', { class: 'main', id: 'go', onclick: async () => {
       const a = $('pw1').value, b = $('pw2').value;
       if (a.length < 8) return err(e, 'Use at least 8 characters.');
       if (a !== b) return err(e, 'The passwords do not match.');
@@ -177,21 +217,22 @@ function passwordScreen(mnemonic, birthday) {
         kv.del(LS_STATE);
         await openSession(secret);
       } catch (x) { err(e, x); $('go').disabled = false; $('go').textContent = 'Create wallet'; }
-    } }, 'Create wallet'));
+    } }, 'Create wallet'))));
 }
 
 // ---------------------------------------------------------------- unlock
 function unlockScreen() {
   const e = h('div', { class: 'err', hidden: true });
   const go = async () => {
-    $('go').disabled = true; $('go').textContent = 'Unlocking…';
+    $('go').disabled = true; $('go').textContent = tr('Unlocking…');
     try { await openSession(await K.unlockVault(store.get(LS_VAULT), $('pw').value)); }
-    catch (x) { err(e, x); $('go').disabled = false; $('go').textContent = 'Unlock'; }
+    catch (x) { err(e, x); $('go').disabled = false; $('go').textContent = tr('Unlock'); }
   };
   gate([h('h2', {}, 'Enter your password'),
       h('input', { id: 'pw', type: 'password', placeholder: 'Password', autocomplete: 'current-password', onkeydown: (ev) => ev.key === 'Enter' && go() }), e],
     [h('button', { class: 'main pill-btn', id: 'go', onclick: go }, 'Unlock'),
-     h('button', { class: 'textbtn', onclick: () => { if (confirm('Forgot your password? It cannot be reset. You can remove this wallet from this browser; only your 12 words can bring it back (restore is coming soon). Remove it now?')) { store.del(LS_VAULT); store.del(LS_NAME); kv.del(LS_STATE); kv.del(LS_PARTIAL); start(); } } }, 'Forgot password')]);
+     h('button', { class: 'textbtn', onclick: () => { if (confirm('Forgot your password? It cannot be reset. You can remove this wallet from this browser; only your 12 words can bring it back (restore is coming soon). Remove it now?')) { store.del(LS_VAULT); store.del(LS_NAME); kv.del(LS_STATE); kv.del(LS_PARTIAL); start(); } } }, 'Forgot password'),
+     h('button', { class: 'textbtn', onclick: () => languageScreen(unlockScreen) }, 'Language')]);
   setTimeout(() => $('pw') && $('pw').focus(), 50);
 }
 
@@ -213,7 +254,7 @@ async function openSession(secret) {
   tab = 'home'; home();
   sync(); loadPrice();
 }
-function lock() { cancelSync(); endSession(); deposit = null; S = null; spage = null; unlockScreen(); }
+function lock() { cancelSync(); endSession(); marketLoadGen++; marketTicker = null; marketState = { ...marketState, loaded: false, loading: false, available: false, error: '' }; deposit = null; S = null; spage = null; unlockScreen(); }
 
 // ---------------------------------------------------------------- site requests (extension only): connect + pay
 // A site on the allow list (background.js) asks through window.shhhhh; background.js keeps the request in
@@ -277,6 +318,7 @@ async function dappScreen() {
     return;
   }
   if (dappReq.method === 'inscribe') return dappInscribe(done, site);
+  if (dappReq.method === 'fairCommit' || dappReq.method === 'fairReveal') return dappFair(done, site);
   if (dappReq.method === 'stake' || dappReq.method === 'unstake') return dappStake(done, site);
   if (dappReq.method === 'proveHolding') return dappProof(done, site, cancel);
   if (['listForSale', 'cancelListing', 'buyListing', 'myItems'].includes(dappReq.method)) return dappMarket(done, site);
@@ -345,25 +387,30 @@ async function dappInscribe(done, site) {
     note: `Requested by ${site}. Only confirm if you started this.`,
     run: async (status) => {
       const request = build(); status('Broadcasting…');
-      await broadcast(request.commit.hex);
-      await finishSend({ txid: request.commit.txid, fee: request.commit.fee, inputs: request.commit.inputs }, 'inscribe', request.fee);
-      const failed = [];
-      for (const reveal of request.reveals) {
-        let sent = false;
-        for (let attempt = 0; attempt < 3 && !sent; attempt++) {
-          try { await broadcast(reveal.hex); sent = true; }
-          catch { await new Promise((resolve) => setTimeout(resolve, 1500)); }
-        }
-        if (!sent) failed.push(reveal);
-      }
-      if (failed.length) {
-        S.state.revealsToSend = [...(S.state.revealsToSend || []), ...failed.map((reveal) => ({ txid: reveal.txid, hex: reveal.hex, at: Date.now() }))];
-        await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
-      }
+      const failed = await broadcastInscriptionRequest(request);
       done({ result: { commitTxid: request.commit.txid, inscriptionIds: request.inscriptionIds, pendingReveals: failed.length } }, failed.length ? 'Sent · some steps retry later' : 'Inscribed ✓');
     },
   });
   box.querySelector('.sheet-back').onclick = () => done({ error: 'Request rejected' });
+}
+
+async function broadcastInscriptionRequest(request) {
+  await broadcast(request.commit.hex);
+  await finishSend({ txid: request.commit.txid, fee: request.commit.fee, inputs: request.commit.inputs }, 'inscribe', request.fee);
+  const failed = [];
+  for (const reveal of request.reveals) {
+    let sent = false;
+    for (let attempt = 0; attempt < 3 && !sent; attempt++) {
+      try { await broadcast(reveal.hex); sent = true; }
+      catch { await new Promise((resolve) => setTimeout(resolve, 1500)); }
+    }
+    if (!sent) failed.push(reveal);
+  }
+  if (failed.length) {
+    S.state.revealsToSend = [...(S.state.revealsToSend || []), ...failed.map((reveal) => ({ txid: reveal.txid, hex: reveal.hex, at: Date.now() }))];
+    await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
+  }
+  return failed;
 }
 
 async function dappProof(done, site, cancel) {
@@ -397,6 +444,57 @@ async function dappProof(done, site, cancel) {
       done({ result: { tick: normalized, sp1: S.wallet.address, proofs } }, 'Proof sent ✓');
     } }, 'Sign proof'),
     cancel,
+  ]);
+}
+
+async function dappFair(done, site) {
+  const title = 'Fair Batch request';
+  if (!(await connectedSites()).includes(dappReq.origin)) return dappFail(done, title, 'Connect this site first.');
+  if (!S.wallet.stake || !S.state) return dappFail(done, title, 'Unlock and sync the wallet first.');
+  const pending = (S.state.fairOrders || []).filter((item) => Date.now() - item.createdAt < 2 * 86400000);
+
+  if (dappReq.method === 'fairCommit') {
+    let order;
+    try { order = normalizeFairOrder({ ...(dappReq.params && dappReq.params.order), walletKey: S.wallet.stake.xonly }); }
+    catch (error) { return dappFail(done, title, 'The site sent an invalid fair order: ' + error.message); }
+    const phase = fairEpoch();
+    if (order.epoch !== phase.epoch || phase.phase !== 'commit') return dappFail(done, title, 'The commit window is not open for this epoch. Refresh the market and try again.');
+    if (pending.some((item) => item.order.epoch === order.epoch && item.order.market === order.market)) return dappFail(done, title, 'This wallet already prepared an order for that market and epoch.');
+    const salt = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+    const commitment = fairCommitment(order, salt);
+    const unsigned = { v: FAIR_VERSION, epoch: order.epoch, market: order.market, walletKey: order.walletKey, commitment };
+    const signature = signMsg(S.wallet.stake.priv, fairCommitMessage(unsigned), crypto.getRandomValues(new Uint8Array(32)));
+    const envelope = { ...unsigned, signature };
+    return gate([
+      h('h2', {}, 'Hide order in Fair Batch'),
+      h('div', { class: 'rv-hero' }, h('b', {}, `${fmt(order.amount)} ${order.market.split('/')[0]}`), h('small', {}, `${order.side} · limit ${fmt(order.limitPrice)} ${order.market.split('/')[1]}`)),
+      h('p', { class: 'fine' }, `${site} will receive only a signed commitment now. The side, amount and limit price stay hidden until you reveal them later in epoch ${order.epoch}.`),
+    ], [
+      h('button', { class: 'main pill-btn', onclick: async () => {
+        S.state.fairOrders = [...pending, { order, salt, envelope, commitment, createdAt: Date.now() }];
+        await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
+        done({ result: envelope }, 'Fair order committed ✓');
+      } }, 'Sign hidden order'),
+      h('button', { class: 'textbtn', onclick: () => done({ error: 'Request rejected' }) }, 'Cancel'),
+    ]);
+  }
+
+  const commitment = String((dappReq.params && dappReq.params.commitment) || '').toLowerCase();
+  const saved = pending.find((item) => item.commitment === commitment);
+  if (!saved || fairCommitment(saved.order, saved.salt) !== commitment) return dappFail(done, title, 'This wallet does not have the requested hidden order.');
+  const phase = fairEpoch();
+  if (saved.order.epoch !== phase.epoch || phase.phase !== 'reveal') return dappFail(done, title, 'The reveal window is not open for this order.');
+  return gate([
+    h('h2', {}, 'Reveal Fair Batch order'),
+    h('div', { class: 'rv-hero' }, h('b', {}, `${fmt(saved.order.amount)} ${saved.order.market.split('/')[0]}`), h('small', {}, `${saved.order.side} · limit ${fmt(saved.order.limitPrice)} ${saved.order.market.split('/')[1]}`)),
+    h('p', { class: 'fine' }, `${site} will now learn the order details. The coordinator can include it in epoch ${saved.order.epoch}; speed within the reveal window does not change its priority.`),
+  ], [
+    h('button', { class: 'main pill-btn', onclick: async () => {
+      saved.revealedAt = Date.now(); S.state.fairOrders = pending;
+      await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state));
+      done({ result: { order: saved.order, salt: saved.salt, commitment: saved.commitment } }, 'Fair order revealed ✓');
+    } }, 'Reveal order'),
+    h('button', { class: 'textbtn', onclick: () => done({ error: 'Request rejected' }) }, 'Cancel'),
   ]);
 }
 
@@ -493,7 +591,7 @@ async function dappMarket(done, site) {
     const id = String(params.inscriptionId || ''), price = params.price;
     if (!/^[0-9a-f]{64}i\d{1,7}$/.test(id)) return dappFail(done, title, 'The site sent a bad inscription id.');
     if (!Number.isInteger(price) || price < MIN_PRICE || price > MAX_PRICE) return dappFail(done, title, `The price must be at least ${fmt(MIN_PRICE)} sats.`);
-    const coin = inscriptionCoin(id), creator = Math.floor(price * ROYALTY_BPS / 10000);
+    const coin = inscriptionCoin(id);
     if (!coin) return dappFail(done, title, 'This inscription is not in your wallet (or it is not confirmed yet).');
     const siblings = view().insc.concat(view().hiddenInsc).filter((item) => item.coin.txid === coin.txid && item.coin.vout === coin.vout && item.id !== id);
     if (siblings.length) return dappFail(done, title, 'This coin holds more than one inscription: selling it would sell them all. Not supported yet.');
@@ -502,8 +600,7 @@ async function dappMarket(done, site) {
       title: 'List for sale', cta: 'Sign & list', hero: { big: btcStr(price) + ' BTC', sub: dollars(price) },
       rows: [
         ['Inscription', short(id, 10, 6)],
-        ['You receive', btcStr(price - creator) + ' BTC', 'the buyer pays the network fee'],
-        ['Creator', btcStr(creator) + ' BTC', ROYALTY_BPS / 100 + '% of the price'],
+        ['You receive', btcStr(price) + ' BTC', 'the buyer pays the network fee'],
         ['Paid to', S.wallet.deposit.address],
         ...(coin.value > 1000 ? [['Goes with it', `${fmt(coin.value)} sats`, 'the whole coin holding the inscription']] : []),
       ],
@@ -535,7 +632,9 @@ async function dappMarket(done, site) {
     const [outspend] = await getOutspends([`${offer.txid}:${offer.vout}`]);
     if (!outspend || !outspend.unspent) return dappFail(done, title, 'This item was already sold or moved.');
     if (!(outspend.confirmations > 0)) return dappFail(done, title, 'The seller’s coin is not confirmed yet. Try again after the next block.');
-    const output = Transaction.fromRaw(hexToBytes(await getTxHex(offer.txid)), { allowUnknownOutputs: true, allowUnknownInputs: true, disableScriptCheck: true }).getOutput(offer.vout);
+    const sourceTx = Transaction.fromRaw(hexToBytes(await getTxHex(offer.txid)), { allowUnknownOutputs: true, allowUnknownInputs: true, disableScriptCheck: true });
+    if (sourceTx.id !== offer.txid) return dappFail(done, title, 'The node returned a transaction with the wrong id.');
+    const output = sourceTx.getOutput(offer.vout);
     if (bytesToHex(output.script) !== '5120' + offer.xonly || Number(output.amount) !== offer.value) return dappFail(done, title, 'The listing does not match the blockchain.');
     const ord = await getOutputInscriptions(`${offer.txid}:${offer.vout}`);
     if (!ord || !(ord.inscriptions || []).includes(offer.inscriptionId)) return dappFail(done, title, 'The seller’s coin does not hold this inscription.');
@@ -564,7 +663,6 @@ async function dappMarket(done, site) {
     title: 'Buy from ' + site, cta: 'Confirm & buy', hero: { big: btcStr(offer.price) + ' BTC', sub: dollars(offer.price) },
     rows: [
       ['Inscription', short(offer.inscriptionId, 10, 6)], ['To', 'Your silent address'], ['Seller is paid', offer.payTo],
-      ...(preview.royalty ? [['Creator', btcStr(preview.royalty) + ' BTC', 'included in the price']] : []),
       ['Network fee', btcStr(preview.fee) + ' BTC', `${feeRate} sat/vB`], ['Total', btcStr(offer.price + preview.fee) + ' BTC', dollars(offer.price + preview.fee)],
     ],
     note: 'One transaction: you pay the price, you get the inscription. Checked on the blockchain just now.',
@@ -617,6 +715,7 @@ const ICONS = {
   save: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
   layers: '<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   coin: '<circle cx="12" cy="12" r="8.5"/><path d="M9.5 9.5h3.5a1.75 1.75 0 0 1 0 3.5H9.5h4a1.75 1.75 0 0 1 0 3.5H9.5"/><path d="M11 8v1.5M11 16.5V18"/>',
+  store: '<path d="M4 10v10h16V10"/><path d="M3 4h18l-2 6a3 3 0 0 1-5 1 3 3 0 0 1-4 0 3 3 0 0 1-5-1L3 4z"/><path d="M9 20v-5h6v5"/>',
   refresh: '<path d="M20 11a8 8 0 0 0-14.9-3.9L3 9"/><path d="M3 4v5h5"/><path d="M4 13a8 8 0 0 0 14.9 3.9L21 15"/><path d="M21 20v-5h-5"/>',
   trash: '<path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/>',
   chev: '<path d="m9 6 6 6-6 6"/>',
@@ -675,7 +774,7 @@ async function openSidePanel() {
   catch { toast('The side panel needs Chrome 116 or newer'); }
 }
 function shell(content) {
-  const tabs = [['home', 'Home', 'home'], ['collect', 'Collectibles', 'grid'], ['activity', 'Activity', 'clock'], ['settings', 'Settings', 'gear']];
+  const tabs = [['home', 'Home', 'home'], ['collect', 'Inscriptions', 'grid'], ['market', 'Market', 'store'], ['activity', 'Activity', 'clock'], ['settings', 'Settings', 'gear']];
   app.replaceChildren(h('div', { class: 'shell' },
     h('header', { class: 'hdr' },
       h('button', { class: 'acct', onclick: (ev) => copy(S.wallet.address, ev.currentTarget.querySelector('small')) },
@@ -689,7 +788,7 @@ function shell(content) {
       h('button', { class: 'tab' + (tab === id ? ' on' : ''), onclick: () => { tab = id; spage = null; render(); } }, icon(ic, 23), h('span', {}, label))))));
   window.scrollTo(0, 0);
 }
-function render() { ({ home, collect, activity, settings })[tab](); }
+function render() { ({ home, collect, market, activity, settings })[tab](); }
 
 // balances from the last node sync
 function view() {
@@ -754,7 +853,7 @@ function home() {
               amount: fmt(t.balance) + ' ' + t.tick, value: t.transferable ? `${fmt(t.transferable)} ready to send` : '', onclick: () => brc20Sheet(t) })),
       !v.ready ? null : !v.tokens.length ? asset({ icon: tokenIcon('shhhhh'), name: 'shhhhh', sub: 'BRC-20', amount: '0 shhhhh', value: '' }) : null),
     v.insc.length ? h('section', { class: 'sect' },
-      h('div', { class: 'sect-hd' }, h('b', {}, 'Collectibles'), h('button', { class: 'link', onclick: () => { tab = 'collect'; render(); } }, 'See all')),
+      h('div', { class: 'sect-hd' }, h('b', {}, 'Inscriptions'), h('button', { class: 'link', onclick: () => { tab = 'collect'; render(); } }, 'Manage')),
       h('div', { class: 'tiles' }, v.insc.slice(0, 3).map(inscTile))) : null,
   ]);
 }
@@ -769,6 +868,18 @@ const inscMeta = new Map();
 async function inscInfo(id) {
   if (!inscMeta.has(id)) inscMeta.set(id, fetch(`${NODE}/v1/ord/inscription/${id}`).then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
   return inscMeta.get(id);
+}
+const inspectedMarketAssets = new Map();
+async function inspectMarketAsset(id) {
+  if (!inspectedMarketAssets.has(id)) inspectedMarketAssets.set(id, (async () => {
+    const meta = await inscInfo(id);
+    if (!/^(text\/plain|application\/json)\b/i.test(meta.content_type || '')) return { kind: 'ordinal' };
+    const response = await fetch(contentUrl(id));
+    if (!response.ok) throw new Error('The inscription content is unavailable.');
+    const body = new Uint8Array(await response.arrayBuffer());
+    return body.length <= 16_384 ? parseMarketAsset(body) : { kind: 'ordinal' };
+  })().catch((error) => { inspectedMarketAssets.delete(id); throw error; }));
+  return inspectedMarketAssets.get(id);
 }
 function inscView(id, big = false) {
   const box = h('div', { class: 'insc-view' + (big ? ' big' : '') }, h('span', { class: 'spin' }));
@@ -804,25 +915,798 @@ function asset({ icon, name, sub, amount, value, soon, skeleton, onclick }) {
       soon ? h('span', { class: 'pill' }, soon) : h('small', {}, value)));
 }
 
-let showHidden = false;
+let showHidden = false, inscriptionFilter = 'all';
 async function setHidden(id, hide) {
   const set = new Set(S.state.hidden || []); hide ? set.add(id) : set.delete(id); S.state.hidden = [...set];
   await kv.set(LS_STATE, await K.sealJSON(S.stateKey, S.state)); render();
 }
 function collect() {
   const v = view();
-  shell([h('h2', { class: 'ttl' }, 'Collectibles'),
-    v.hiddenInsc.length ? h('button', { class: 'link', onclick: () => { showHidden = !showHidden; render(); } }, showHidden ? 'Hide hidden items' : `Show hidden (${v.hiddenInsc.length})`) : null,
-    showHidden && v.hiddenInsc.length ? h('div', { class: 'tiles dim' }, v.hiddenInsc.map(inscTile)) : null,
-    v.insc.length ? h('div', { class: 'tiles' }, v.insc.map(inscTile))
-      : h('div', { class: 'empty' }, h('div', { class: 'big-ic' }, icon('grid', 28)), h('b', {}, v.ready ? 'No inscriptions yet' : 'Loading…'),
-          h('p', {}, 'Art and BRC-20 inscriptions show up here.'))]);
+  const showTokens = inscriptionFilter === 'all' || inscriptionFilter === 'brc20';
+  const showItems = inscriptionFilter === 'all' || inscriptionFilter === 'ordinals';
+  const filters = [['all', 'All'], ['brc20', 'BRC-20'], ['ordinals', 'Ordinals']];
+  shell([
+    h('div', { class: 'insc-head' }, h('div', {}, h('h2', { class: 'ttl' }, 'Inscriptions'), h('p', { class: 'fine' }, 'Bitcoin Ordinals and BRC-20')),
+      h('button', { class: 'insc-new', onclick: () => inscriptionCenterSheet() }, icon('plus', 17), 'Inscribe')),
+    h('section', { class: 'insc-summary' },
+      h('div', {}, h('small', {}, 'Network'), h('b', {}, 'Bitcoin')),
+      h('div', {}, h('small', {}, 'Ordinals'), h('b', {}, v.ready ? fmt(v.insc.length) : '—')),
+      h('div', {}, h('small', {}, 'BRC-20'), h('b', {}, v.ready ? fmt(v.tokens.length) : '—'))),
+    h('div', { class: 'insc-kinds' },
+      inscriptionKindButton('coin', 'BRC-20', 'Transfer balances', () => inscriptionCenterSheet('brc20')),
+      inscriptionKindButton('layers', 'BRC2.0', 'Call contracts', () => inscriptionCenterSheet('brc2')),
+      inscriptionKindButton('pen', 'Text', 'Plain text', () => inscriptionCenterSheet('text')),
+      inscriptionKindButton('image', 'Image', 'PNG, JPEG, GIF', () => inscriptionCenterSheet('image'))),
+    pendingCard(),
+    h('div', { class: 'insc-filter' }, filters.map(([id, label]) => h('button', { class: inscriptionFilter === id ? 'sel' : '', onclick: () => { inscriptionFilter = id; collect(); } }, label))),
+    showTokens && v.tokens.length ? h('section', { class: 'insc-section' },
+      h('div', { class: 'sect-hd' }, h('b', {}, 'BRC-20 assets'), h('small', {}, 'Tap to transfer')),
+      h('div', { class: 'list' }, v.tokens.map((t) => asset({ icon: tokenIcon(t.tick), name: t.tick, sub: t.selfMint ? 'BRC-20 · self-mint' : 'BRC-20',
+        amount: `${fmt(t.balance)} ${t.tick}`, value: t.available ? `${fmt(t.available)} available` : `${fmt(t.transferable)} transferable`, onclick: () => brc20Sheet(t) })))) : null,
+    showItems ? h('section', { class: 'insc-section' },
+      h('div', { class: 'sect-hd' }, h('b', {}, 'My inscriptions'),
+        v.hiddenInsc.length ? h('button', { class: 'link', onclick: () => { showHidden = !showHidden; collect(); } }, showHidden ? 'Hide spam' : `Hidden ${v.hiddenInsc.length}`) : null),
+      showHidden && v.hiddenInsc.length ? h('div', { class: 'tiles dim' }, v.hiddenInsc.map(inscTile)) : null,
+      v.insc.length ? h('div', { class: 'tiles' }, v.insc.map(inscTile))
+        : h('div', { class: 'empty compact' }, h('div', { class: 'big-ic' }, icon('grid', 28)), h('b', {}, v.ready ? 'No inscriptions yet' : 'Loading…'),
+            h('p', {}, 'Receive inscriptions or use the transfer tools above.'))) : null,
+  ]);
+}
+
+function inscriptionKindButton(ic, title, subtitle, onclick) {
+  return h('button', { onclick }, h('i', {}, icon(ic, 21)), h('span', {}, h('b', {}, title), h('small', {}, subtitle)));
+}
+
+// ---------------------------------------------------------------- built-in inscription market
+// Offers are non-custodial: the seller's SINGLE|ANYONECANPAY signature fixes
+// the inscription input, price and payout. The buyer re-checks Bitcoin + ord
+// immediately before building the atomic purchase transaction.
+const unavailableFeePolicy = {
+  minerAsset: 'BTC', silentFallback: false,
+  btc: { enabled: true, payer: 'buyer' },
+  shhhhh: { enabled: false, ticker: 'shhhhh', payer: 'sponsor', reason: 'The shhhhh fee Sponsor is not online yet.' },
+};
+// Kept false until this client can build and verify the two-party PSBT with an
+// independent Sponsor. A server flag alone must never turn token charging on.
+const SPONSORED_MARKET_BUY = false;
+let marketState = { loaded: false, loading: false, available: false, listings: [], error: '', policy: unavailableFeePolicy };
+let marketFilter = 'all';
+let marketLength = 'all';
+let marketTicker = null;
+let marketOrderSort = 'low';
+let marketLoadGen = 0;
+const MARKET_DEMOS = [
+  { tick: 'ordi', amount: '1000', tickerBytes: 4, price: 12000, a: '#f0a03c', b: '#6d3cff' },
+  { tick: 'sats', amount: '250000', tickerBytes: 4, price: 18000, a: '#59c3ff', b: '#12233a' },
+  { tick: 'rats', amount: '50000', tickerBytes: 4, price: 25000, a: '#ff5c8a', b: '#35152a' },
+  { tick: 'meme', amount: '21000', tickerBytes: 4, price: 33000, a: '#3fd68f', b: '#10251c' },
+  { tick: 'pizza', amount: '10', tickerBytes: 5, price: 42000, a: '#ff7849', b: '#22252d' },
+  { tick: 'nodes', amount: '100', tickerBytes: 5, price: 55000, a: '#39d7ff', b: '#0c3b5c' },
+  { tick: 'honey', amount: '250', tickerBytes: 5, price: 69000, a: '#ffd45c', b: '#5b2d00' },
+  { tick: 'peace', amount: '888', tickerBytes: 5, price: 88000, a: '#ae8cff', b: '#211839' },
+  { tick: 'shhhhh', amount: '1000', tickerBytes: 6, price: 105000, a: '#f0a03c', b: '#23180d' },
+  { tick: 'orange', amount: '25', tickerBytes: 6, price: 144000, a: '#ff9e45', b: '#422108' },
+  { tick: 'wallet', amount: '500', tickerBytes: 6, price: 210000, a: '#4fe394', b: '#153527' },
+  { tick: 'bitmap', amount: '42', tickerBytes: 6, price: 321000, a: '#70a7ff', b: '#14243d' },
+];
+
+function ownedMarketCoin(offer) {
+  if (!S?.state || !Array.isArray(S.state.coins)) return null;
+  return walletCoins().find((coin) => coin.txid === offer.txid && coin.vout === offer.vout && coin.xonly === offer.xonly);
+}
+
+async function loadMarket(force = false) {
+  if (!S || marketState.loading || (marketState.loaded && !force)) return;
+  const generation = ++marketLoadGen, session = S;
+  marketState.loading = true; marketState.error = '';
+  if (S && tab === 'market') market();
+  try {
+    const [book, policy] = await Promise.all([
+      getMarketListings({ limit: 50 }),
+      getMarketFeePolicy().catch(() => unavailableFeePolicy),
+    ]);
+    const listings = [];
+    for (const item of Array.isArray(book.listings) ? book.listings : []) {
+      try { verifyOffer(item.offer); listings.push({ ...item, asset: cleanMarketAsset(item.asset) }); } catch { /* never trust an invalid server entry */ }
+    }
+    if (generation !== marketLoadGen || S !== session) return;
+    marketState = { loaded: true, loading: false, available: true, listings, error: '', policy: policy || unavailableFeePolicy };
+  } catch (error) {
+    if (generation !== marketLoadGen || S !== session) return;
+    marketState = { ...marketState, loaded: true, loading: false, available: false, error: friendly(error.message), policy: marketState.policy || unavailableFeePolicy };
+  }
+  if (S && tab === 'market') market();
+}
+
+function market() {
+  tab = 'market';
+  if (marketTicker) return marketTickerPage();
+  marketBrowsePage();
+  if (!marketState.loaded && !marketState.loading) setTimeout(() => loadMarket(), 0);
+}
+
+function marketFiltered(items, mine = marketFilter === 'mine') {
+  const scoped = mine ? items.filter((item) => ownedMarketCoin(item.offer)) : items;
+  return marketLength === 'all' ? scoped : scoped.filter((item) => marketAssetCategory(item.asset) === marketLength);
+}
+
+function decimalParts(value) {
+  const [whole = '0', fraction = ''] = String(value).split('.');
+  return { units: BigInt((whole + fraction).replace(/^0+(?=\d)/, '') || '0'), scale: fraction.length };
+}
+
+function decimalText(units, scale) {
+  let text = units.toString();
+  if (!scale) return text;
+  text = text.padStart(scale + 1, '0');
+  const value = `${text.slice(0, -scale)}.${text.slice(-scale)}`.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+  return value;
+}
+
+function sumTokenAmounts(values) {
+  const parts = values.map(decimalParts), scale = Math.max(0, ...parts.map((part) => part.scale));
+  const total = parts.reduce((sum, part) => sum + part.units * 10n ** BigInt(scale - part.scale), 0n);
+  return decimalText(total, scale);
+}
+
+function multiplyTokenAmount(value, factor) {
+  const part = decimalParts(value);
+  return decimalText(part.units * BigInt(factor), part.scale);
+}
+
+function compareUnitPrice(left, right) {
+  const a = decimalParts(left.asset.amount), b = decimalParts(right.asset.amount);
+  const l = BigInt(left.offer.price) * 10n ** BigInt(a.scale) * b.units;
+  const r = BigInt(right.offer.price) * 10n ** BigInt(b.scale) * a.units;
+  return l < r ? -1 : l > r ? 1 : left.offer.price - right.offer.price;
+}
+
+function unitSatsText(price, amount, precision = 8) {
+  const part = decimalParts(amount), base = 10n ** BigInt(precision);
+  const value = BigInt(price) * 10n ** BigInt(part.scale) * base / part.units;
+  if (!value) return `<${decimalText(1n, precision)}`;
+  return decimalText(value, precision);
+}
+
+function groupMarketListings(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const asset = cleanMarketAsset(item.asset);
+    if (asset.kind !== 'brc20') continue;
+    const current = groups.get(asset.tick) || { tick: asset.tick, tickerBytes: asset.tickerBytes, listings: [], demo: false };
+    current.listings.push({ ...item, asset }); groups.set(asset.tick, current);
+  }
+  return [...groups.values()].map((group) => {
+    group.listings.sort(compareUnitPrice); group.floor = group.listings[0];
+    group.amount = sumTokenAmounts(group.listings.map((item) => item.asset.amount));
+    return group;
+  }).sort((a, b) => compareUnitPrice(a.floor, b.floor));
+}
+
+function demoOrders(demo) {
+  return [
+    { amountFactor: 1, priceFactor: 1 },
+    { amountFactor: 4, priceFactor: 3 },
+    { amountFactor: 12, priceFactor: 8 },
+  ].map((variant, index) => ({
+    demo: true,
+    asset: { kind: 'brc20', protocol: 'brc-20', op: 'transfer', tick: demo.tick, tickerBytes: demo.tickerBytes, amount: multiplyTokenAmount(demo.amount, variant.amountFactor) },
+    offer: { inscriptionId: `demo-${demo.tick}-${index + 1}`, price: demo.price * variant.priceFactor },
+    palette: demo,
+  }));
+}
+
+function demoMarketGroups() {
+  return MARKET_DEMOS.filter((demo) => marketLength === 'all' || String(demo.tickerBytes) === marketLength).map((demo) => {
+    const listings = demoOrders(demo); listings.sort(compareUnitPrice);
+    return { tick: demo.tick, tickerBytes: demo.tickerBytes, listings, floor: listings[0], amount: sumTokenAmounts(listings.map((item) => item.asset.amount)), demo: true, palette: demo };
+  });
+}
+
+function marketTokenLogo(group, large = false) {
+  let hash = 0; for (const char of group.tick) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  const color = group.palette?.a || `hsl(${hash % 360} 76% 57%)`;
+  return h('span', { class: `market-token-logo${large ? ' large' : ''}`, style: `--token-color:${color}` }, group.tick.slice(0, 1).toUpperCase());
+}
+
+function marketTokenRow(group) {
+  const floor = group.floor;
+  return h('button', { class: 'market-token-row', 'data-market-ticker': group.tick, 'data-ticker-bytes': group.tickerBytes, 'data-demo': group.demo ? 'true' : 'false', onclick: () => {
+    marketTicker = { tick: group.tick, demo: group.demo }; marketOrderSort = 'low'; market();
+  } },
+  h('span', { class: 'market-token-main' }, marketTokenLogo(group), h('span', {}, h('b', {}, group.tick), h('small', {}, `${displayTokenAmount(group.amount)} · ${fmt(group.listings.length)} ${group.listings.length === 1 ? 'listing' : 'listings'}`))),
+  h('span', { class: 'market-token-floor' }, h('b', {}, `${unitSatsText(floor.offer.price, floor.asset.amount)} sats`), h('small', {}, `${btcStr(floor.offer.price)} BTC`)),
+  h('span', { class: `market-token-side${group.demo ? ' demo' : ''}` }, group.demo ? 'Demo' : fmt(group.listings.length)),
+  icon('chev', 15));
+}
+
+function marketTokenTable(groups, demo = false) {
+  return h('section', { class: `market-token-section${demo ? ' demo' : ''}` },
+    h('div', { class: 'market-section-head' }, h('div', {}, h('b', {}, demo ? 'Demo markets' : 'Live markets'), h('small', {}, demo ? 'Layout preview · not on-chain' : 'Verified BRC-20 transfer listings')),
+      h('span', { class: 'market-badge' }, fmt(groups.length))),
+    h('div', { class: 'market-table-head' }, h('span', {}, 'Token / listings'), h('span', {}, 'Floor price'), h('span', {}, demo ? 'Demo' : 'Listings')),
+    groups.length ? h('div', { class: 'market-token-list' }, groups.map(marketTokenRow))
+      : h('div', { class: 'empty compact market-empty' }, h('div', { class: 'big-ic' }, icon('store', 24)), h('b', {}, 'No listings in this category'), h('p', {}, 'Choose another ticker length or list an inscription.')));
+}
+
+function marketBrowsePage() {
+  const all = marketState.listings;
+  const scoped = marketFilter === 'mine' ? all.filter((item) => ownedMarketCoin(item.offer)) : all;
+  const listings = marketFiltered(all);
+  const groups = groupMarketListings(listings);
+  const categoryCount = (category) => category === 'all' ? scoped.length : scoped.filter((item) => marketAssetCategory(item.asset) === category).length;
+  const shhhhhReady = SPONSORED_MARKET_BUY && marketState.policy?.shhhhh?.enabled && marketState.policy.shhhhh.execution === 'psbt-v1';
+  shell([
+    h('div', { class: 'market-head' },
+      h('h2', { class: 'ttl' }, 'Market'),
+      h('div', { class: 'market-tools' },
+        h('button', { class: marketState.loading ? 'icon spinning' : 'icon', title: 'Refresh market', 'aria-label': 'Refresh market', onclick: () => loadMarket(true) }, icon('refresh', 18)),
+        h('button', { class: 'insc-new', disabled: !marketState.available, title: marketState.available ? 'Sell' : 'Market unavailable', onclick: marketListSheet }, icon('plus', 17), 'Sell')),
+      h('p', { class: 'fine market-subtitle' }, '4, 5 and 6-byte BRC-20 transfer market')),
+    h('section', { class: 'market-controls' },
+      h('div', { class: 'insc-filter market-filter' }, [['all', 'Explore'], ['mine', 'My listings']].map(([id, label]) =>
+        h('button', { class: marketFilter === id ? 'sel' : '', 'aria-pressed': marketFilter === id, onclick: () => { marketFilter = id; market(); } }, label))),
+      h('div', { class: 'market-length-head' }, h('b', {}, 'Ticker length'), h('small', {}, 'UTF-8 bytes')),
+      h('div', { class: 'market-length-filter' }, [['all', 'All'], ['4', '4-byte'], ['5', '5-byte'], ['6', '6-byte']].map(([id, label]) =>
+        h('button', { class: marketLength === id ? 'sel' : '', 'data-market-length': id, 'aria-pressed': marketLength === id, onclick: () => { marketLength = id; market(); } },
+          h('span', {}, label), h('small', {}, marketState.loaded ? fmt(categoryCount(id)) : '—'))))),
+    h('div', { class: 'market-security-line' }, icon('lock', 15), h('span', {}, h('b', {}, 'Non-custodial settlement'), h('small', {}, 'Seller keeps custody · miners receive BTC')), h('i', {}, shhhhhReady ? 'shhhhh Sponsor online' : 'BTC fees')),
+    marketState.error
+      ? h('div', { class: 'market-service-banner' }, icon('clock', 18), h('span', {}, h('b', {}, 'Market server pending'), h('small', {}, 'Demo mode is available until deployment.')), h('button', { onclick: () => loadMarket(true) }, 'Try again'))
+      : marketState.loading && !all.length ? h('div', { class: 'market-loading-line' }, h('span', { class: 'spin' }), 'Loading market…') : null,
+    marketTokenTable(groups),
+    marketFilter === 'all' ? h('div', { class: 'market-demo-wrap' },
+      h('button', { class: 'market-guide-link', onclick: () => marketDemoSheet(MARKET_DEMOS[0]) }, icon('eye', 16), h('span', {}, h('b', {}, 'How trading works'), h('small', {}, 'Verify · choose fee · review · atomic settlement')), icon('chev', 16)),
+      marketTokenTable(demoMarketGroups(), true)) : null,
+  ]);
+}
+
+function selectedMarketGroup() {
+  if (marketTicker.demo) {
+    const demo = MARKET_DEMOS.find((item) => item.tick === marketTicker.tick);
+    if (!demo) return null;
+    const listings = demoOrders(demo); listings.sort(compareUnitPrice);
+    return { tick: demo.tick, tickerBytes: demo.tickerBytes, listings, floor: listings[0], amount: sumTokenAmounts(listings.map((item) => item.asset.amount)), demo: true, palette: demo };
+  }
+  return groupMarketListings(marketState.listings).find((group) => group.tick === marketTicker.tick) || null;
+}
+
+function marketStat(label, value, detail) {
+  return h('div', { class: 'market-stat' }, h('small', {}, label), h('b', {}, value), detail ? h('span', {}, detail) : null);
+}
+
+function marketOrderCard(item, index) {
+  const asset = cleanMarketAsset(item.asset), own = !item.demo && !!ownedMarketCoin(item.offer);
+  return h('article', { class: `market-order-card${item.demo ? ' demo' : ''}`, 'data-market-order': index + 1 },
+    h('div', { class: 'market-order-top' },
+      marketTokenLogo({ tick: asset.tick, palette: item.palette }),
+      h('span', {}, h('b', {}, `${displayTokenAmount(asset.amount)} ${asset.tick}`), h('small', {}, item.demo ? `Demo #${index + 1}` : `#${short(item.offer.inscriptionId, 7, 4)}`)),
+      h('button', { onclick: () => item.demo ? marketDemoSheet({ ...item.palette, amount: asset.amount, price: item.offer.price }) : own ? marketCancelSheet(item) : marketBuySheet(item) }, item.demo ? 'Preview flow' : own ? 'Manage' : 'Buy')),
+    h('div', { class: 'market-order-values' },
+      h('span', {}, h('small', {}, 'Unit price'), h('b', {}, `${unitSatsText(item.offer.price, asset.amount)} sats`), h('i', {}, `sats/${asset.tick}`)),
+      h('span', {}, h('small', {}, 'Total price'), h('b', {}, `${btcStr(item.offer.price)} BTC`), h('i', {}, dollars(item.offer.price) || ''))));
+}
+
+function marketTickerPage() {
+  const group = selectedMarketGroup();
+  if (!group) { marketTicker = null; return marketBrowsePage(); }
+  const source = !group.demo && marketFilter === 'mine' ? group.listings.filter((item) => ownedMarketCoin(item.offer)) : group.listings;
+  const listings = source.slice().sort(compareUnitPrice);
+  if (marketOrderSort === 'high') listings.reverse();
+  const lowestTotal = Math.min(...group.listings.map((item) => item.offer.price));
+  shell([
+    h('div', { class: 'market-detail-head' },
+      h('button', { class: 'market-detail-back', 'aria-label': 'Back to markets', onclick: () => { marketTicker = null; marketFilter = 'all'; market(); } }, icon('back', 21)),
+      marketTokenLogo(group, true),
+      h('span', { class: 'market-detail-title' }, h('b', {}, group.tick), h('small', {}, 'BRC-20'), h('i', {}, `${group.tickerBytes}-byte`)),
+      h('button', { class: 'market-detail-sell', disabled: group.demo || !marketState.available, onclick: marketListSheet }, group.demo ? 'Demo' : 'Sell')),
+    group.demo ? h('div', { class: 'market-demo-note detail' }, icon('eye', 16), h('span', {}, 'These examples cannot be purchased and never request a signature.')) : null,
+    h('section', { class: 'market-stat-grid' },
+      marketStat('Floor price', `${unitSatsText(group.floor.offer.price, group.floor.asset.amount)} sats`, `per ${group.tick}`),
+      marketStat('Lowest total', `${btcStr(lowestTotal)} BTC`, dollars(lowestTotal)),
+      marketStat('Listings', fmt(group.listings.length), group.demo ? 'Demo orders' : 'Active signed offers'),
+      marketStat('Listed amount', displayTokenAmount(group.amount), group.tick),
+      marketStat('24h volume', '—', 'No verified trade history yet'),
+      marketStat('Settlement', 'Atomic BTC', 'Seller keeps custody')),
+    h('div', { class: 'market-detail-tabs' }, [['all', 'Market'], ['mine', 'My listings']].map(([id, label]) => h('button', {
+      class: marketFilter === id ? 'sel' : '', disabled: group.demo && id === 'mine', onclick: () => { marketFilter = id; market(); },
+    }, label))),
+    h('div', { class: 'market-order-toolbar' }, h('b', {}, `${fmt(listings.length)} ${listings.length === 1 ? 'listing' : 'listings'}`), h('button', { onclick: () => { marketOrderSort = marketOrderSort === 'low' ? 'high' : 'low'; market(); } }, marketOrderSort === 'low' ? 'Price: low to high' : 'Price: high to low', icon('chev', 13))),
+    listings.length ? h('div', { class: 'market-order-list' }, listings.map(marketOrderCard))
+      : h('div', { class: 'empty compact market-empty' }, h('div', { class: 'big-ic' }, icon('store', 24)), h('b', {}, 'No active listings'), h('p', {}, 'Choose Sell to list one of your inscriptions.')),
+  ]);
+}
+
+function displayTokenAmount(value) {
+  const [whole, fraction] = String(value).split('.');
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return fraction == null ? grouped : `${grouped}.${fraction}`;
+}
+
+function marketTickerArtwork(asset, palette = {}, big = false) {
+  asset = cleanMarketAsset(asset);
+  let hash = 0; for (const char of asset.tick || 'ord') hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  const a = palette.a || `hsl(${hash % 360} 78% 58%)`, b = palette.b || `hsl(${(hash + 42) % 360} 52% 16%)`;
+  return h('div', { class: `market-token-art${big ? ' big' : ''}`, style: `--token-a:${a};--token-b:${b}` },
+    h('span', { class: 'market-token-protocol' }, 'BRC-20'),
+    h('b', {}, asset.tick),
+    h('small', {}, h('span', {}, displayTokenAmount(asset.amount)), ' · ', h('span', {}, 'Transfer')),
+    h('i', {}, `${asset.tickerBytes}-byte`));
+}
+
+function demoInscription(demo, big = false) {
+  return marketTickerArtwork({ kind: 'brc20', tick: demo.tick, tickerBytes: demo.tickerBytes, amount: demo.amount }, demo, big);
+}
+
+function demoMarketSection() {
+  const demos = marketLength === 'all' ? MARKET_DEMOS : MARKET_DEMOS.filter((demo) => String(demo.tickerBytes) === marketLength);
+  return h('section', { class: 'market-demo-section' },
+    h('div', { class: 'market-section-head' }, h('div', {}, h('b', {}, 'Demo catalog'), h('small', {}, '4, 5 and 6-byte transfer examples')), h('span', { class: 'market-badge' }, 'Not on-chain')),
+    h('div', { class: 'market-demo-note' }, icon('eye', 17), h('span', {}, 'These examples cannot be purchased and never request a signature.')),
+    h('div', { class: 'market-flow-strip' }, ['Verify', 'Choose fee', 'Review', 'Atomic settlement'].map((label, index) => h('span', {}, h('i', {}, index + 1), h('b', {}, label)))),
+    h('div', { class: 'market-grid market-demo-grid' }, demos.map((demo) => h('article', { class: 'market-card demo', 'data-ticker-bytes': demo.tickerBytes },
+      h('div', { class: 'market-thumb' }, demoInscription(demo)),
+      h('div', { class: 'market-card-body' },
+        h('div', { class: 'market-card-id' }, h('b', {}, `${demo.tick} · ${displayTokenAmount(demo.amount)}`), h('span', { class: 'market-badge' }, 'Demo')),
+        h('div', { class: 'market-card-price' }, h('b', {}, btcStr(demo.price) + ' BTC'), h('small', {}, 'Example price')),
+        h('div', { class: 'market-card-foot' }, h('button', { class: 'market-card-action', onclick: () => marketDemoSheet(demo) }, 'Preview flow')))))));
+}
+
+function marketDemoSheet(demo) {
+  sheet((close) => [
+    h('h3', {}, 'How a market purchase works'), demoInscription(demo, true),
+    h('div', { class: 'market-demo-steps' },
+      h('div', {}, h('i', {}, '1'), h('span', {}, h('b', {}, 'Verify'), h('small', {}, 'The wallet checks the signed offer, Bitcoin output and inscription.'))),
+      h('div', {}, h('i', {}, '2'), h('span', {}, h('b', {}, 'Choose fee'), h('small', {}, 'Pay the miner fee with BTC, or shhhhh when a Sponsor is online.'))),
+      h('div', {}, h('i', {}, '3'), h('span', {}, h('b', {}, 'Review'), h('small', {}, 'Confirm the item price, seller payment and network fee separately.'))),
+      h('div', {}, h('i', {}, '4'), h('span', {}, h('b', {}, 'Atomic settlement'), h('small', {}, 'One Bitcoin transaction pays the seller and delivers the inscription.')))),
+    h('p', { class: 'warn' }, 'Demo only — this item is not on-chain and cannot be purchased.'),
+    h('button', { class: 'main', onclick: close }, 'Got it'),
+  ]);
+}
+
+function marketListingCard(item) {
+  const offer = item.offer, own = !!ownedMarketCoin(offer), asset = cleanMarketAsset(item.asset), category = marketAssetCategory(asset);
+  return h('article', { class: 'market-card', 'data-ticker-bytes': category },
+    h('div', { class: 'market-thumb' }, asset.kind === 'brc20' ? marketTickerArtwork(asset) : inscView(offer.inscriptionId)),
+    h('div', { class: 'market-card-body' },
+      h('div', { class: 'market-card-id' }, h('b', {}, asset.kind === 'brc20' ? [h('span', {}, `${asset.tickerBytes}-byte`), ' · ', displayTokenAmount(asset.amount)] : short(offer.inscriptionId, 8, 5)), own ? h('span', { class: 'market-badge' }, 'Yours') : null),
+      h('div', { class: 'market-card-price' }, h('b', {}, btcStr(offer.price) + ' BTC'), dollars(offer.price) ? h('small', {}, dollars(offer.price)) : null),
+      h('div', { class: 'market-card-foot' },
+        h('button', { class: 'market-card-action', onclick: () => own ? marketCancelSheet(item) : marketBuySheet(item) }, own ? 'Manage' : 'Buy'))));
+}
+
+function marketSellItem(item, onclick) {
+  const title = h('b', {}, short(item.id, 10, 7));
+  const detail = h('small', {}, `${fmt(item.coin.value)} sats`);
+  const button = h('button', { class: 'market-sell-item', onclick }, h('div', { class: 'market-sell-thumb' }, inscView(item.id)),
+    h('span', {}, title, detail), icon('chev', 18));
+  inspectMarketAsset(item.id).then((asset) => {
+    if (asset.kind !== 'brc20' || !button.isConnected) return;
+    title.textContent = asset.tick;
+    detail.textContent = `${displayTokenAmount(asset.amount)} · ${tr(`${asset.tickerBytes}-byte`)} · BRC-20`;
+  }).catch(() => {});
+  return button;
+}
+
+function marketListSheet() {
+  if (!S.wallet.deposit) return toast('Lock and unlock the wallet once, then try again');
+  const active = new Set(marketState.listings.map((item) => `${item.offer.txid}:${item.offer.vout}`));
+  const items = view().insc.filter((item) => !active.has(`${item.coin.txid}:${item.coin.vout}`));
+  const close = sheet(() => [
+    h('h3', {}, 'Sell an inscription'),
+    h('p', { class: 'fine' }, 'Choose one item. It stays in your wallet until an atomic purchase confirms.'),
+    items.length ? h('div', { class: 'market-sell-list' }, items.map((item) => marketSellItem(item, () => {
+      close(); setTimeout(() => marketPriceSheet(item), 260);
+    })))
+      : h('div', { class: 'empty compact' }, h('div', { class: 'big-ic' }, icon('grid', 26)), h('b', {}, 'No inscription available'), h('p', {}, 'Listed, hidden and unconfirmed items are not shown.')),
+  ]);
+}
+
+function marketPriceSheet(item) {
+  const coin = ownedMarketCoin({ txid: item.coin.txid, vout: item.coin.vout, xonly: item.coin.xonly });
+  if (!coin) return toast('This inscription is not spendable yet');
+  const siblings = view().insc.concat(view().hiddenInsc).filter((candidate) => candidate.coin.txid === item.coin.txid && candidate.coin.vout === item.coin.vout && candidate.id !== item.id);
+  if (siblings.length) return toast('This output holds more than one inscription and cannot be listed');
+  const price = h('input', { inputmode: 'decimal', autocomplete: 'off', placeholder: '0.00010000' });
+  const e = h('div', { class: 'err', hidden: true });
+  const close = sheet(() => [
+    h('h3', {}, 'Set a price'), inscView(item.id, true),
+    h('label', { class: 'field' }, 'Price', h('div', { class: 'inwrap' }, price, h('span', { class: 'unit-in' }, 'BTC'))),
+    h('p', { class: 'fine left' }, `Minimum ${btcStr(MIN_PRICE)} BTC. There is no listing fee; you receive the full price.`), e,
+    h('button', { class: 'main', onclick: (event) => {
+      e.hidden = true;
+      try {
+        const sats = toSats(price.value);
+        if (sats < MIN_PRICE || sats > MAX_PRICE) throw new Error(`price must be at least ${MIN_PRICE} sats`);
+        const offer = createOffer({ coin, inscriptionId: item.id, price: sats, payTo: S.wallet.deposit.address });
+        reviewIn(event.currentTarget.closest('.sheet'), {
+          title: 'Review listing', cta: 'Sign & list', hero: { big: btcStr(sats) + ' BTC', sub: dollars(sats) },
+          rows: [['Inscription', short(item.id, 10, 6)], ['You receive', btcStr(sats) + ' BTC'], ['Listing fee', 'Free']],
+          note: 'The signed offer cannot move your item by itself. Moving the inscription makes the offer unusable, but copied offers remain valid until then.',
+          run: async (status) => {
+            status('Publishing…'); await listMarketOffer(offer); close(); toast('Listed ✓');
+            marketState.loaded = false; setTimeout(() => loadMarket(true), 300);
+          },
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Review listing'),
+  ]);
+}
+
+function marketCancelSheet(item) {
+  const offer = item.offer, coin = ownedMarketCoin(offer);
+  if (!coin) return toast('This listing is not from this wallet');
+  const close = sheet(() => [h('h3', {}, 'Manage listing'), inscView(offer.inscriptionId, true), h('button', { class: 'main bad', onclick: (event) => {
+    reviewIn(event.currentTarget.closest('.sheet'), {
+      title: 'Cancel listing', cta: 'Cancel listing', hero: { big: btcStr(offer.price) + ' BTC', sub: 'listed price' },
+      rows: [['Inscription', short(offer.inscriptionId, 10, 6)], ['Network fee', 'Free']],
+      note: 'This removes the offer from the shhhhh market. A copied signed offer can only be invalidated completely by moving the inscription.',
+      run: async (status) => {
+        status('Cancelling…'); await cancelMarketListing(offer, cancelOffer(offer, coin.priv)); close(); toast('Listing cancelled ✓');
+        marketState.loaded = false; setTimeout(() => loadMarket(true), 300);
+      },
+    });
+  } }, 'Cancel listing')]);
+}
+
+function marketBuySheet(item) {
+  const offer = item.offer, asset = cleanMarketAsset(item.asset);
+  if (ownedMarketCoin(offer)) return marketCancelSheet(item);
+  const policy = marketState.policy || unavailableFeePolicy;
+  // The Sponsor path is enabled only when both the server and this wallet
+  // advertise the PSBT protocol. A bare "enabled" flag is never enough.
+  const sponsorReady = SPONSORED_MARKET_BUY && policy.shhhhh?.enabled && policy.shhhhh.execution === 'psbt-v1';
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  let rateOf = () => 2;
+  const btc = h('button', { class: 'fee-method sel' }, h('b', {}, 'BTC'), h('small', {}, 'You pay the miner fee'));
+  const token = h('button', { class: 'fee-method' + (sponsorReady ? '' : ' off'), disabled: !sponsorReady },
+    h('b', {}, 'shhhhh'), h('small', {}, sponsorReady ? 'Sponsor pays miners in BTC' : (policy.shhhhh?.reason || 'Sponsor not online')));
+  const close = sheet(() => [
+    h('h3', {}, 'Buy inscription'), asset.kind === 'brc20' ? marketTickerArtwork(asset, {}, true) : inscView(offer.inscriptionId, true),
+    h('div', { class: 'rv-hero' }, h('b', {}, btcStr(offer.price) + ' BTC'), dollars(offer.price) ? h('small', {}, dollars(offer.price)) : null),
+    h('label', { class: 'field' }, 'Pay network fee with', h('div', { class: 'fee-methods' }, btc, token),
+      h('small', { class: 'fee-method-note' }, sponsorReady ? 'Miners receive BTC in both modes.' : 'shhhhh is never converted silently and the wallet will not fall back without asking.')),
+    h('label', { class: 'field' }, 'Bitcoin fee rate', feeBox), e,
+    h('button', { class: 'main', onclick: async (event) => {
+      e.hidden = true; const button = event.currentTarget; button.disabled = true; button.textContent = tr('Checking listing…');
+      try { await reviewMarketPurchase(button.closest('.sheet'), close, item, rateOf()); }
+      catch (error) { err(e, error); button.disabled = false; button.textContent = tr('Review purchase'); }
+    } }, 'Review purchase'),
+  ]);
+  feePicker(feeBox).then((getter) => { rateOf = getter; });
+}
+
+async function checkMarketOffer(offer, expectedAsset) {
+  verifyOffer(offer);
+  const [outspend] = await getOutspends([`${offer.txid}:${offer.vout}`]);
+  if (!outspend?.unspent) throw new Error('This item was already sold or moved.');
+  if (!(outspend.confirmations > 0)) throw new Error('The seller output is not confirmed yet.');
+  const sourceTx = Transaction.fromRaw(hexToBytes(await getTxHex(offer.txid)), { allowUnknownOutputs: true, allowUnknownInputs: true, disableScriptCheck: true });
+  if (sourceTx.id !== offer.txid) throw new Error('The node returned a transaction with the wrong id.');
+  const output = sourceTx.getOutput(offer.vout);
+  if (bytesToHex(output.script) !== '5120' + offer.xonly || Number(output.amount) !== offer.value) throw new Error('The listing does not match the blockchain.');
+  const ord = await getOutputInscriptions(`${offer.txid}:${offer.vout}`);
+  if (!Array.isArray(ord?.inscriptions) || ord.inscriptions.length !== 1 || ord.inscriptions[0] !== offer.inscriptionId) throw new Error('The output no longer holds exactly this inscription.');
+  if (ord.runes && Object.keys(ord.runes).length) throw new Error('The seller output also holds runes.');
+  const actualAsset = await inspectMarketAsset(offer.inscriptionId);
+  if (!sameMarketAsset(expectedAsset, actualAsset)) throw new Error('The listing asset details do not match the inscription.');
+  return actualAsset;
+}
+
+async function reviewMarketPurchase(sheetEl, close, item, feeRate) {
+  const offer = item.offer, asset = await checkMarketOffer(offer, item.asset);
+  const build = () => buildPurchase({ wallet: S.wallet, utxos: walletCoins(), offer, feeRate });
+  let preview;
+  try { preview = build(); }
+  catch (error) {
+    if (error.message !== 'NEED_PREPARE') throw error;
+    const prepare = () => buildSend({ utxos: walletCoins(), recipients: [{ address: S.wallet.address, value: PREPARE_COIN_VALUE }, { address: S.wallet.address, value: PREPARE_COIN_VALUE }], feeRate, changeAddress: S.wallet.changeAddress });
+    const tx = prepare();
+    reviewIn(sheetEl, {
+      title: 'One step before buying', cta: 'Prepare my wallet', hero: { big: 'Prepare to buy', sub: 'one time' },
+      rows: [['What', 'Split BTC into 3 wallet coins'], ['Network fee', btcStr(tx.fee) + ' BTC', `${feeRate} sat/vB`]],
+      note: 'The coins stay in your wallet. After one confirmation, open the listing and press Buy again.',
+      run: async (status) => { const request = prepare(); status('Broadcasting…'); const { txid } = await broadcast(request.hex); await finishSend({ ...request, txid }, 'prepare', request.fee); close(); toast('Prepared ✓ Buy after 1 confirmation'); setTimeout(sync, 4000); },
+    });
+    return;
+  }
+  reviewIn(sheetEl, {
+    title: 'Review purchase', cta: 'Confirm & buy', hero: { big: btcStr(offer.price) + ' BTC', sub: dollars(offer.price) },
+    rows: [
+      ...(asset.kind === 'brc20' ? [['Ticker', asset.tick], ['Amount', displayTokenAmount(asset.amount)], ['Ticker length', `${asset.tickerBytes}-byte`]] : []),
+      ['Inscription', short(offer.inscriptionId, 10, 6)], ['Seller receives', btcStr(offer.price) + ' BTC'],
+      ['Network fee', btcStr(preview.fee) + ' BTC', `paid with BTC · ${feeRate} sat/vB`],
+      ['Total BTC', btcStr(offer.price + preview.fee) + ' BTC', dollars(offer.price + preview.fee)],
+    ],
+    note: 'Atomic settlement: the seller is paid and the inscription moves to your silent address in the same Bitcoin transaction.',
+    run: async (status) => {
+      const request = build(); status('Broadcasting…'); const { txid } = await broadcast(request.hex);
+      await finishSend({ ...request, txid }, 'buy', offer.price + request.fee, { inscriptionId: offer.inscriptionId });
+      marketState.listings = marketState.listings.filter((item) => item.offer.inscriptionId !== offer.inscriptionId);
+      close(); toast('Bought ✓'); render(); setTimeout(sync, 4000);
+    },
+  });
+}
+
+function inscriptionCenterSheet(initialKind = 'brc20') {
+  const body = h('div', { class: 'insc-center' });
+  const close = sheet(() => [body]);
+  const renderKind = (kind) => {
+    body.replaceChildren(
+      h('div', { class: 'insc-center-title' }, h('h3', {}, 'Inscription center'), h('p', { class: 'fine' }, 'Create directly on Bitcoin')),
+      h('div', { class: 'network-row' }, h('span', {}, h('i', {}, '₿'), h('b', {}, 'Bitcoin')), h('small', {}, 'Mainnet')),
+      h('div', { class: 'insc-kind-tabs' },
+        [['brc20', 'coin', 'BRC-20'], ['brc2', 'layers', 'BRC2.0'], ['text', 'pen', 'Text'], ['image', 'image', 'Image']].map(([id, ic, label]) =>
+          h('button', { class: kind === id ? 'sel' : '', onclick: () => renderKind(id) }, icon(ic, 19), h('span', {}, label)))),
+      h('div', { class: 'insc-compose' }),
+    );
+    const composer = body.querySelector('.insc-compose');
+    if (kind === 'brc20') brc20Composer(composer, close);
+    if (kind === 'brc2') brc2Composer(composer, close);
+    if (kind === 'text') textComposer(composer, close);
+    if (kind === 'image') imageComposer(composer, close);
+  };
+  renderKind(initialKind);
+}
+
+function composerTabs(box, tabs, initial) {
+  const nav = h('div', { class: 'composer-tabs' });
+  const content = h('div', { class: 'composer-body' });
+  const select = (id) => {
+    [...nav.children].forEach((button) => button.classList.toggle('sel', button.dataset.id === id));
+    content.replaceChildren(); tabs.find((tab) => tab.id === id).render(content);
+  };
+  nav.replaceChildren(...tabs.map((item) => h('button', { 'data-id': item.id, onclick: () => select(item.id) }, item.label)));
+  box.replaceChildren(nav, content); select(initial);
+}
+
+function brc20Composer(box, close) {
+  brc20TransferList(box, close);
+}
+
+function brc20MintForm(box, close) {
+  const tick = h('input', { maxlength: '24', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: 'e.g. shhhhh' });
+  const amount = h('input', { inputmode: 'decimal', autocomplete: 'off', placeholder: 'Amount per mint' });
+  const count = h('input', { type: 'number', min: '1', max: '25', step: '1', value: '1', inputmode: 'numeric' });
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  const bytePick = h('div', { class: 'composer-tabs ticker-byte-pick' });
+  const byteMeter = h('small', { class: 'byte-meter' }, '0 / 4 bytes');
+  const namespaceNote = h('p', { class: 'fine left namespace-note' });
+  let expectedBytes = 4;
+  let rateOf = () => 2;
+  const byteLength = () => new TextEncoder().encode(tick.value.trim().normalize('NFC').replace(/[A-Z]/g, (letter) => letter.toLowerCase())).length;
+  const updateBytes = () => {
+    const actual = byteLength();
+    byteMeter.textContent = tr(`${actual} / ${expectedBytes} bytes`);
+    byteMeter.classList.toggle('bad', actual > 0 && actual !== expectedBytes);
+  };
+  const selectBytes = (size) => {
+    expectedBytes = size;
+    [...bytePick.children].forEach((button) => button.classList.toggle('sel', Number(button.dataset.bytes) === size));
+    namespaceNote.textContent = tr(size === 5
+      ? '5-byte tokens are deployer-only self-mints. This wallet can display and transfer them; minting stays locked until the required parent inscription is available.'
+      : size === 6
+        ? '6-byte tickers use the programmable namespace and only allow letters, numbers or dash.'
+        : '4-byte tickers use the classic public-mint namespace.');
+    const next = box.querySelector('.brc20-next'); if (next) next.disabled = size === 5;
+    updateBytes();
+  };
+  bytePick.replaceChildren(...[4, 5, 6].map((size) => h('button', { 'data-bytes': String(size), onclick: (event) => { event.preventDefault(); selectBytes(size); } }, `${size} bytes`)));
+  tick.addEventListener('input', updateBytes);
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, 'Mint an existing BRC-20 token. Verify its ticker and mint limits before continuing.'),
+    h('label', { class: 'field' }, 'Ticker length', bytePick),
+    h('label', { class: 'field' }, 'Ticker', tick, byteMeter), namespaceNote,
+    h('label', { class: 'field' }, 'Amount', amount),
+    h('label', { class: 'field' }, 'Number of mints', count),
+    h('label', { class: 'field' }, 'Fee', feeBox),
+    h('div', { class: 'destination-row' }, h('span', {}, 'Recipient'), h('b', {}, 'This wallet')),
+    e,
+    h('button', { class: 'main brc20-next', onclick: (ev) => {
+      e.hidden = true;
+      try {
+        const copies = Number(count.value), rate = rateOf(), cleanTick = normalizeBrc20Tick(tick.value);
+        const actualBytes = brc20TickerBytes(cleanTick);
+        if (actualBytes !== expectedBytes) throw new Error(`ticker must be exactly ${expectedBytes} UTF-8 bytes`);
+        const body = brc20Mint(cleanTick, amount.value);
+        if (!Number.isInteger(copies) || copies < 1 || copies > 25) throw new Error('number of mints must be from 1 to 25');
+        const cleanAmount = amount.value.trim();
+        reviewLocalInscription(ev.currentTarget.closest('.sheet'), close, {
+          items: Array.from({ length: copies }, () => ({ contentType: BRC20_CT, body })), rate,
+          title: 'Review BRC-20 mint', hero: `${fmt(cleanAmount)} ${cleanTick}`, detail: `${copies === 1 ? '1 mint' : `${copies} mints`} · ${actualBytes} bytes`,
+          content: `MINT ${cleanTick}`,
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Next'),
+  );
+  selectBytes(4);
+  feePicker(feeBox).then((fn) => { rateOf = fn; });
+}
+
+function brc20TransferList(box, close) {
+  const tokens = view().tokens.filter((token) => Number(token.available) > 0);
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, 'BRC-20 transfers use two Bitcoin transactions: prepare the transfer inscription, then send it after confirmation.'),
+    tokens.length ? h('div', { class: 'list' }, tokens.map((token) => asset({ icon: tokenIcon(token.tick), name: token.tick, sub: 'Available to transfer',
+      amount: `${fmt(token.available)} ${token.tick}`, value: '2 steps', onclick: () => { close(); brc20Sheet(token); } })))
+      : h('div', { class: 'empty compact' }, h('div', { class: 'big-ic' }, icon('coin', 26)), h('b', {}, 'No transferable BRC-20'),
+          h('p', {}, 'Tokens with an available balance will appear here.')),
+  );
+}
+
+function brc2Composer(box, close) {
+  brc2CallForm(box, close);
+}
+
+function brc2CallForm(box, close) {
+  const contract = h('input', { autocomplete: 'off', spellcheck: 'false', placeholder: '0x contract address' });
+  const inscriptionId = h('input', { autocomplete: 'off', spellcheck: 'false', placeholder: 'Or deployment inscription ID' });
+  const data = h('textarea', { rows: '5', autocomplete: 'off', spellcheck: 'false', placeholder: '0x ABI-encoded calldata' });
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  let rateOf = () => 2;
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, 'Call an existing BRC2.0 smart contract with pre-encoded EVM calldata. Enter one contract target only.'),
+    h('p', { class: 'warn' }, 'BRC2.0 contract data and the BRC20PROG protocol output are public. Spendable change still returns through the silent wallet change path.'),
+    h('label', { class: 'field' }, 'Contract address', contract),
+    h('label', { class: 'field' }, 'Deployment inscription', inscriptionId),
+    h('label', { class: 'field' }, 'Calldata', data),
+    h('label', { class: 'field' }, 'Fee', feeBox), e,
+    h('button', { class: 'main', onclick: (event) => {
+      e.hidden = true;
+      try {
+        const body = brc2Call({ contract: contract.value, inscriptionId: inscriptionId.value, data: data.value });
+        reviewBrc2Inscription(event.currentTarget.closest('.sheet'), close, {
+          body, rate: rateOf(), title: 'Review contract call', hero: 'BRC2.0 call',
+          content: contract.value.trim() || inscriptionId.value.trim(),
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Next'),
+  );
+  feePicker(feeBox).then((fn) => { rateOf = fn; });
+}
+
+function brc2DeployForm(box, close) {
+  const data = h('textarea', { rows: '8', autocomplete: 'off', spellcheck: 'false', placeholder: '0x bytecode and constructor arguments' });
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  let rateOf = () => 2;
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, 'Deploy compiled EVM bytecode to BRC2.0. Source code and ABI are not inscribed.'),
+    h('p', { class: 'warn' }, 'Advanced action: verify the compiled bytecode independently. Deployments are permanent and public.'),
+    h('label', { class: 'field' }, 'Deployment data', data),
+    h('label', { class: 'field' }, 'Fee', feeBox), e,
+    h('button', { class: 'main', onclick: (event) => {
+      e.hidden = true;
+      try {
+        const body = brc2Deploy(data.value);
+        reviewBrc2Inscription(event.currentTarget.closest('.sheet'), close, {
+          body, rate: rateOf(), title: 'Review contract deployment', hero: 'BRC2.0 deploy',
+          content: `${fmt((data.value.trim().length - 2) / 2)} bytes`,
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Next'),
+  );
+  feePicker(feeBox).then((fn) => { rateOf = fn; });
+}
+
+function reviewBrc2Inscription(sheetEl, close, { body, rate, title, hero, content }) {
+  const nonce = Date.now();
+  const build = () => buildBrc2Inscribe({ wallet: S.wallet, utxos: walletCoins(), body, feeRate: rate, changeAddress: S.wallet.changeAddress, nonce });
+  let preview;
+  try { preview = build(); } catch (error) { const box = sheetEl.querySelector('.err'); if (box) err(box, error); return; }
+  reviewIn(sheetEl, {
+    title, cta: 'Confirm & inscribe', hero: { big: hero, sub: 'Bitcoin mainnet' },
+    rows: [
+      ['Content', short(content, 12, 10)],
+      ['Protocol output', 'OP_RETURN BRC20PROG'],
+      ['Silent change', 'Enabled'],
+      ['Network fees', btcStr(preview.fee) + ' BTC', `${rate} sat/vB`],
+      ['Protocol postage', `${fmt(preview.postage)} sats`, 'sent to the unspendable protocol output'],
+      ['Total', btcStr(preview.fee + preview.postage) + ' BTC', dollars(preview.fee + preview.postage)],
+    ],
+    note: 'The contract operation is public by protocol design. No reusable receiving address is placed in the protocol output; spendable wallet change follows the silent change path.',
+    run: async (status) => {
+      const request = build(); status('Broadcasting commit…');
+      const failed = await broadcastInscriptionRequest(request);
+      close(); toast(failed.length ? 'BRC2.0 reveal will retry automatically' : 'BRC2.0 operation sent ✓');
+      render(); setTimeout(sync, 4000);
+    },
+  });
+}
+
+function textComposer(box, close) {
+  const text = h('textarea', { rows: '7', maxlength: String(MAX_INSCRIPTION_BYTES), placeholder: 'Enter the text to inscribe', spellcheck: 'true' });
+  const count = h('input', { type: 'number', min: '1', max: '25', step: '1', value: '1', inputmode: 'numeric' });
+  const meter = h('small', { class: 'byte-meter' }, `0 / ${fmt(MAX_INSCRIPTION_BYTES)} bytes`);
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  let rateOf = () => 2;
+  text.addEventListener('input', () => { meter.textContent = `${fmt(new TextEncoder().encode(text.value).length)} / ${fmt(MAX_INSCRIPTION_BYTES)} bytes`; });
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, 'Plain text is stored permanently on Bitcoin. Do not include passwords, recovery phrases or personal information.'),
+    h('label', { class: 'field' }, 'Text', text, meter),
+    h('label', { class: 'field' }, 'Number of copies', count),
+    h('label', { class: 'field' }, 'Fee', feeBox), e,
+    h('button', { class: 'main', onclick: (ev) => {
+      e.hidden = true;
+      try {
+        const body = new TextEncoder().encode(text.value), copies = Number(count.value), rate = rateOf();
+        if (!body.length || body.length > MAX_INSCRIPTION_BYTES) throw new Error(`text must be 1 to ${MAX_INSCRIPTION_BYTES} bytes`);
+        if (!Number.isInteger(copies) || copies < 1 || copies > 25) throw new Error('number of copies must be from 1 to 25');
+        reviewLocalInscription(ev.currentTarget.closest('.sheet'), close, {
+          items: Array.from({ length: copies }, () => ({ contentType: 'text/plain;charset=utf-8', body })), rate,
+          title: 'Review text inscription', hero: copies === 1 ? '1 inscription' : `${copies} inscriptions`, detail: `${fmt(body.length)} bytes each`,
+          content: text.value.slice(0, 80),
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Next'),
+  );
+  feePicker(feeBox).then((fn) => { rateOf = fn; });
+}
+
+function imageComposer(box, close) {
+  const files = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/gif,image/webp,image/avif,image/svg+xml', multiple: true });
+  const picked = h('div', { class: 'picked-files' }, h('span', {}, 'No images selected'));
+  const feeBox = h('div', { class: 'rates' }), e = h('div', { class: 'err', hidden: true });
+  let rateOf = () => 2;
+  files.addEventListener('change', () => {
+    const list = [...files.files];
+    picked.replaceChildren(...(list.length ? list.map((file) => h('div', {}, h('span', {}, file.name), h('small', {}, `${fmt(file.size)} bytes`))) : [h('span', {}, 'No images selected')]));
+  });
+  box.replaceChildren(
+    h('p', { class: 'fine left' }, `Choose up to 25 images. Each image must be ${fmt(MAX_INSCRIPTION_BYTES)} bytes or smaller.`),
+    h('label', { class: 'image-drop' }, icon('image', 28), h('b', {}, 'Choose images'), h('small', {}, 'PNG, JPEG, GIF, WebP, AVIF or SVG'), files),
+    picked,
+    h('label', { class: 'field' }, 'Fee', feeBox), e,
+    h('button', { class: 'main', onclick: async (ev) => {
+      e.hidden = true;
+      try {
+        const selected = [...files.files], rate = rateOf();
+        if (!selected.length || selected.length > 25) throw new Error('choose between 1 and 25 images');
+        const allowed = /^image\/(png|jpeg|gif|webp|avif|svg\+xml)$/i;
+        if (selected.some((file) => !allowed.test(file.type))) throw new Error('one of the selected image types is not supported');
+        if (selected.some((file) => !file.size || file.size > MAX_INSCRIPTION_BYTES)) throw new Error(`each image must be 1 to ${MAX_INSCRIPTION_BYTES} bytes`);
+        const items = await Promise.all(selected.map(async (file) => ({ contentType: file.type, body: new Uint8Array(await file.arrayBuffer()) })));
+        reviewLocalInscription(ev.currentTarget.closest('.sheet'), close, {
+          items, rate, title: 'Review image inscription', hero: selected.length === 1 ? '1 image' : `${selected.length} images`,
+          detail: `${fmt(selected.reduce((sum, file) => sum + file.size, 0))} bytes`, content: selected.map((file) => file.name).join(', ').slice(0, 100),
+        });
+      } catch (error) { err(e, error); }
+    } }, 'Next'),
+  );
+  feePicker(feeBox).then((fn) => { rateOf = fn; });
+}
+
+function reviewLocalInscription(sheetEl, close, { items, rate, title, hero, detail, content }) {
+  const nonce = Date.now();
+  const build = () => buildInscribe({ wallet: S.wallet, utxos: walletCoins(), items, feeRate: rate, changeAddress: S.wallet.changeAddress, to: S.wallet.address, nonce });
+  let preview;
+  try { preview = build(); } catch (error) {
+    const box = sheetEl.querySelector('.err'); if (box) err(box, error); return;
+  }
+  reviewIn(sheetEl, {
+    title, cta: 'Confirm & inscribe', hero: { big: hero, sub: detail },
+    rows: [
+      ['Content', content],
+      ['Recipient', 'Your private wallet'],
+      ['Network fees', btcStr(preview.fee) + ' BTC', `${rate} sat/vB`],
+      ['Postage', `${fmt(preview.postage)} sats`, 'stays with the inscriptions'],
+      ['Total', btcStr(preview.fee + preview.postage) + ' BTC', dollars(preview.fee + preview.postage)],
+    ],
+    note: 'Bitcoin inscriptions use a commit transaction followed by one reveal per item. Network fees cannot be recovered after broadcast.',
+    run: async (status) => {
+      const request = build(); status('Broadcasting commit…');
+      const failed = await broadcastInscriptionRequest(request);
+      close(); toast(failed.length ? `${failed.length} reveal${failed.length === 1 ? '' : 's'} will retry automatically` : 'Inscribed ✓');
+      render(); setTimeout(sync, 4000);
+    },
+  });
 }
 
 function activity() {
   const st = S.state, sent = new Map(((st && st.sent) || []).map((x) => [x.txid, x]));
   const rows = [];
-  for (const x of (st && st.sent) || []) rows.push({ txid: x.txid, height: x.height || 0, dir: 'out', amount: x.amount, label: x.kind === 'inscription' ? 'Sent inscription' : 'Sent' });
+  for (const x of (st && st.sent) || []) rows.push({ txid: x.txid, height: x.height || 0, dir: 'out', amount: x.amount,
+    label: x.kind === 'inscription' ? 'Sent inscription' : x.kind === 'inscribe' ? 'Created inscription' : 'Sent' });
   for (const t of (st && st.txs) || []) {
     if (sent.has(t.txid)) continue;                         // our own send: its change is not a "receive"
     const mine = st.coins.filter((c) => c.txid === t.txid);
@@ -850,8 +1734,8 @@ function activity() {
 // build(close) returns the sheet's content; returns close()
 function sheet(build) {
   const close = () => { bg.classList.remove('open'); setTimeout(() => bg.remove(), 250); };
-  const x = h('button', { class: 'sheet-x', 'aria-label': 'Close', onclick: () => close() }, '✕');
-  const bg = h('div', { class: 'sheet-bg', onclick: (ev) => ev.target === bg && close() }, h('div', { class: 'sheet' }, x, h('div', { class: 'grab' }), ...build(close)));
+  const back = h('button', { class: 'sheet-x sheet-root-back', 'aria-label': 'Back', onclick: close }, icon('back', 20));
+  const bg = h('div', { class: 'sheet-bg', onclick: (ev) => ev.target === bg && close() }, h('div', { class: 'sheet' }, back, h('div', { class: 'grab' }), ...build(close)));
   document.body.append(bg); requestAnimationFrame(() => bg.classList.add('open'));
   return close;
 }
@@ -894,11 +1778,11 @@ function reviewIn(sheetEl, { title, hero, rows, note, cta, run }) {
   const e = h('div', { class: 'err', hidden: true });
   const pw = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Wallet password' });
   const go = h('button', { class: 'main pill-btn', onclick: async () => {
-    e.hidden = true; go.disabled = true; go.textContent = 'Checking password…';
+    e.hidden = true; go.disabled = true; go.textContent = tr('Checking password…');
     try {
       await K.unlockVault(store.get(LS_VAULT), pw.value);       // re-check the password before spending
-      await run((t) => { go.textContent = t; });
-    } catch (x) { err(e, x); go.disabled = false; go.textContent = cta; }
+      await run((t) => { go.textContent = tr(t); });
+    } catch (x) { err(e, x); go.disabled = false; go.textContent = tr(cta); }
   } }, cta);
   pw.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') go.click(); });
   const row = ([k, v, sub]) => isAddr(v)
@@ -910,7 +1794,7 @@ function reviewIn(sheetEl, { title, hero, rows, note, cta, run }) {
     hero ? h('div', { class: 'rv-hero' }, h('b', {}, hero.big), hero.sub ? h('small', {}, hero.sub) : null) : null,
     h('div', { class: 'rv-card' }, rows.map(row)),
     note ? h('p', { class: 'warn' }, note) : null,
-    pw, e, go,
+    pw, e, actionBar(go),
   ].filter(Boolean));
   setTimeout(() => pw.focus(), 60);
 }
@@ -1000,7 +1884,7 @@ function receiveSheet() {
   document.body.append(bg); requestAnimationFrame(() => bg.classList.add('open'));
 }
 function toast(msg) {
-  const t = h('div', { class: 'toast' }, msg); document.body.append(t);
+  const t = h('div', { class: 'toast' }, tr(String(msg))); document.body.append(t);
   requestAnimationFrame(() => t.classList.add('show')); setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 2200);
 }
 function copy(text, el) {
@@ -1260,6 +2144,7 @@ async function sync(quiet = false) {
         snap.hidden = (carry && carry.hidden) || [];
         snap.moves = (carry && carry.moves) || [];
         snap.stakes = (carry && carry.stakes) || [];
+        snap.fairOrders = (carry && carry.fairOrders) || [];
         snap.revealsToSend = (carry && carry.revealsToSend) || [];
         S.state = snap; S.partial = null;
         await kv.del(LS_PARTIAL); await kv.set(LS_STATE, await K.sealJSON(S.stateKey, snap));
@@ -1276,6 +2161,7 @@ async function sync(quiet = false) {
     r.pending = (carry && carry.pending) || [];
     r.hidden = (carry && carry.hidden) || [];
     r.stakes = (carry && carry.stakes) || [];
+    r.fairOrders = (carry && carry.fairOrders) || [];
     r.moves = ((carry && carry.moves) || []).map((m) => (!m.doneAt && r.txs.some((t) => t.txid === m.txid && t.height > 0) ? { ...m, doneAt: Date.now() } : m)).filter((m) => !m.doneAt || Date.now() - m.doneAt < 60000);
     r.revealsToSend = [];
     for (const reveal of (carry && carry.revealsToSend) || []) {
@@ -1329,7 +2215,9 @@ function settings() {
   spage = null;
   shell([h('h2', { class: 'ttl' }, 'Settings'),
     h('div', { class: 'sgroup' }, 'Wallet'),
-    h('div', { class: 'slist' }, srow('pen', 'Wallet name', walletName(), 'name')),
+    h('div', { class: 'slist' },
+      srow('pen', 'Wallet name', walletName(), 'name'),
+      srow('globe', 'Language', (LANGUAGES.find((option) => option.code === language()) || LANGUAGES[0]).native, 'language')),
     h('div', { class: 'sgroup' }, 'Security'),
     h('div', { class: 'slist' },
       srow('lock', 'Auto-lock', lockLabel(autoLockMin()), 'autolock'),
@@ -1366,6 +2254,18 @@ function coolingDown(k) {
 const pwField = (id) => h('input', { id, type: 'password', autocomplete: 'current-password', placeholder: 'Password' });
 const NAME_MAX = 24;
 const PAGES = {
+  language() {
+    const current = language();
+    spageView('globe', 'Language', 'Choose display language. English is used by default.', [
+      h('div', { class: 'slist language-list' }, LANGUAGES.map((option) =>
+        h('button', { class: 'srow opt' + (option.code === current ? ' sel' : ''), 'aria-pressed': option.code === current, onclick: () => {
+          setLanguage(option.code);
+          toast('Language changed'); spage = null; settings();
+        } },
+        h('span', { class: 'srow-t' }, h('b', {}, option.native), h('small', {}, option.english)),
+        option.code === current ? h('span', { class: 'opt-ck' }, icon('check', 18)) : null))),
+    ]);
+  },
   name() {
     const e = h('div', { class: 'err', hidden: true });
     const inp = h('input', { id: 'wname', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'off', spellcheck: 'false', value: walletName(), placeholder: 'Silent wallet' });
